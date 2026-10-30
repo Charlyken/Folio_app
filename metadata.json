@@ -1,0 +1,6 @@
+{
+  "name": "Folio — Liseuse PDF & Bibliothèque Éditoriale",
+  "description": "Application web de liseuse de livres numériques (PDF) haut de gamme inspirée d'Amazon Kindle, dotée d'une Clean Architecture, d'un rendu Canvas haute résolution et d'une persistance IndexedDB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
