@@ -45,6 +45,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     visiblePages,
     progressPercentage,
     remainingPercentage,
+    readingTimeSummary,
     isCurrentPageBookmarked,
     canGoPrevious,
     canGoNext,
@@ -53,6 +54,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     goToPage,
     setTheme,
     setViewMode,
+    toggleAutoCropMargins,
     zoomIn,
     zoomOut,
     resetZoomLevel,
@@ -60,6 +62,9 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     toggleBookmarkOnPage,
     addAnnotation,
     removeAnnotation,
+    exportNotesAsMarkdown,
+    exportNotesAsJson,
+    importNotesFromJson,
   } = reader;
 
   const [isChromeVisible, setIsChromeVisible] = useState<boolean>(true);
@@ -105,7 +110,6 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     (event: React.MouseEvent<HTMLDivElement>) => {
       const y = event.clientY;
       const vh = window.innerHeight;
-      // Reveal toolbars immediately when hovering near top 110px or bottom 110px, or keep visible on movement
       if (y <= 110 || y >= vh - 110 || isChromeVisible) {
         revealChrome();
       }
@@ -167,10 +171,12 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       data-testid="reader-view-container"
       data-theme={session.theme}
       data-view-mode={session.viewMode}
+      data-auto-crop={String(session.autoCropMargins)}
       data-current-page={session.currentPage}
       className={`min-h-screen w-full flex flex-col transition-colors duration-200 ${backdropClass}`}
     >
       <ReaderControls
+        documentHandle={documentHandle}
         bookTitle={book.title}
         bookAuthor={book.author}
         currentPage={session.currentPage}
@@ -178,9 +184,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         totalPages={documentHandle.totalPages}
         progressPercentage={progressPercentage}
         remainingPercentage={remainingPercentage}
+        readingTimeSummary={readingTimeSummary}
         zoomLevel={session.zoomLevel}
         theme={session.theme}
         viewMode={session.viewMode}
+        autoCropMargins={session.autoCropMargins}
         bookmarks={session.bookmarks}
         annotations={session.annotations}
         isCurrentPageBookmarked={isCurrentPageBookmarked}
@@ -196,6 +204,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         onGoToPage={goToPage}
         onSetTheme={setTheme}
         onSetViewMode={setViewMode}
+        onToggleAutoCropMargins={toggleAutoCropMargins}
         onZoomIn={zoomIn}
         onZoomOut={zoomOut}
         onResetZoom={resetZoomLevel}
@@ -203,16 +212,20 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         onToggleBookmarkPage={toggleBookmarkOnPage}
         onAddAnnotation={addAnnotation}
         onRemoveAnnotation={removeAnnotation}
+        onExportMarkdown={exportNotesAsMarkdown}
+        onExportJson={exportNotesAsJson}
+        onImportJson={importNotesFromJson}
         onChromeInteraction={revealChrome}
       />
 
-      <main className="flex-1 flex flex-col items-center justify-center pt-14 pb-16">
+      <main className="flex-1 flex flex-col items-center justify-center pt-14 pb-20">
         <ReaderCanvas
           documentHandle={documentHandle}
           visiblePages={visiblePages}
           zoomLevel={session.zoomLevel}
           theme={session.theme}
           viewMode={session.viewMode}
+          autoCropMargins={session.autoCropMargins}
           canGoPrevious={canGoPrevious}
           canGoNext={canGoNext}
           onPreviousPage={goToPreviousPage}

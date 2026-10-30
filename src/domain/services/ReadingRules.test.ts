@@ -6,18 +6,26 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  assembleByteRangeFromChunks,
   calculateProgressPercentage,
   calculateRemainingPercentage,
   clampZoomLevel,
+  computeSha256Hex,
+  estimateReadingTimeRemaining,
   formatFileSize,
+  generateReadingNotesMarkdown,
   getNextPageNumber,
   getPrefetchPageNumber,
   getPreviousPageNumber,
   getVisiblePageNumbers,
   normalizeTargetPage,
+  parseStudySheetJson,
+  serializeStudySheetJson,
+  splitBufferIntoChunks,
   stepZoomIn,
   stepZoomOut,
   togglePageBookmark,
+  updateRollingReadingPace,
 } from './ReadingRules';
 
 test('calculateProgressPercentage and calculateRemainingPercentage compute accurate bounds', () => {
@@ -81,4 +89,71 @@ test('formatFileSize formats bytes into French units', () => {
   assert.equal(formatFileSize(512), '512 o');
   assert.equal(formatFileSize(2048), '2 Ko');
   assert.equal(formatFileSize(2.5 * 1024 * 1024), '2,5 Mo');
+});
+
+test('splitBufferIntoChunks and assembleByteRangeFromChunks slice and reassemble binary ranges accurately', () => {
+  const source = new Uint8Array(250);
+  for (let i = 0; i < source.length; i++) {
+    source[i] = i % 251;
+  }
+  const chunks = splitBufferIntoChunks(source, 64);
+  assert.equal(chunks.length, 4);
+
+  const range = assembleByteRangeFromChunks(chunks, 64, 250, 50, 140);
+  assert.equal(range.byteLength, 90);
+  assert.deepEqual(range, source.slice(50, 140));
+});
+
+test('computeSha256Hex returns deterministic 64-char hex digest', async () => {
+  const bytes = new TextEncoder().encode('Folio PDF Content').buffer;
+  const h1 = await computeSha256Hex(bytes);
+  const h2 = await computeSha256Hex(bytes);
+  assert.equal(h1.length, 64);
+  assert.equal(h1, h2);
+});
+
+test('updateRollingReadingPace and estimateReadingTimeRemaining compute chapter and book ETA', () => {
+  const updatedPace = updateRollingReadingPace(40, 60);
+  assert.equal(updatedPace, 46);
+  // Out-of-bounds dwell time is ignored
+  assert.equal(updateRollingReadingPace(40, 1), 40);
+
+  const eta = estimateReadingTimeRemaining(
+    2,
+    10,
+    [
+      { title: '01. Intro', pageNumber: 2, items: [] },
+      { title: '02. Chapitre II', pageNumber: 5, items: [] },
+    ],
+    60
+  );
+  assert.equal(eta.bookRemainingSeconds, 480);
+  assert.equal(eta.chapterRemainingSeconds, 180);
+  assert.ok(eta.formattedSummary.includes('3 min dans ce chapitre'));
+});
+
+test('generateReadingNotesMarkdown and JSON round-trip preserve bookmarks and annotations', () => {
+  const annotations = [
+    {
+      id: 'n1',
+      pageNumber: 3,
+      note: 'Note importante sur la lumière zénithale.',
+      createdAt: 1700000000000,
+      color: 'amber' as const,
+    },
+  ];
+  const md = generateReadingNotesMarkdown(
+    { title: 'Monographie', author: 'Labrouste', totalPages: 10 },
+    [2, 3],
+    annotations,
+    [{ title: 'Chapitre I', pageNumber: 2, items: [] }]
+  );
+  assert.ok(md.includes('# Fiche de Lecture — Monographie'));
+  assert.ok(md.includes('Note importante sur la lumière zénithale.'));
+
+  const json = serializeStudySheetJson('Monographie', [2, 3], annotations);
+  const parsed = parseStudySheetJson(json, 10);
+  assert.deepEqual(parsed.bookmarks, [2, 3]);
+  assert.equal(parsed.annotations.length, 1);
+  assert.equal(parsed.annotations[0].note, 'Note importante sur la lumière zénithale.');
 });

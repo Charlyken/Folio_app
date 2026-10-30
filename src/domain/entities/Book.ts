@@ -10,6 +10,8 @@ export interface Book {
   readonly totalPages: number;
   readonly coverDataUrl: string;
   readonly fileSizeBytes: number;
+  readonly contentHash?: string;
+  readonly chunkCount?: number;
   readonly addedAt: number;
   readonly lastReadAt: number | null;
 }

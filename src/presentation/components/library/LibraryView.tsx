@@ -4,10 +4,11 @@
  */
 
 import React, { useState } from 'react';
-import { BookOpen, Plus, RotateCcw, Search } from 'lucide-react';
+import { BookOpen, CheckCircle2, Plus, RotateCcw, Search, X } from 'lucide-react';
 import { LibraryFilter, UseLibraryResult } from '../../../application/useLibrary';
 import { BookCard } from './BookCard';
 import { PdfDropzone } from './PdfDropzone';
+import { PWAInstallControl } from './PWAInstallControl';
 
 export interface LibraryViewProps {
   readonly library: UseLibraryResult;
@@ -27,6 +28,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
   const {
     libraryState,
     uploadState,
+    deduplicationNotice,
     activeFilter,
     searchQuery,
     filteredBooks,
@@ -36,6 +38,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
     deleteBook,
     restoreSampleBooks,
     dismissUploadError,
+    dismissDeduplicationNotice,
   } = library;
 
   const allBooksCount =
@@ -112,6 +115,46 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
 
       {/* Main Content Container */}
       <main className="flex-1 w-full max-w-[1280px] mx-auto px-6 lg:px-12 py-8 sm:py-12">
+        {/* SHA-256 Deduplication Notice Banner */}
+        {deduplicationNotice && (
+          <div
+            role="status"
+            className="mb-8 p-4 border border-stone-300 dark:border-stone-700 bg-white dark:bg-stone-900 flex items-start justify-between gap-4"
+          >
+            <div className="flex items-start gap-3">
+              <CheckCircle2 className="w-5 h-5 text-[#14532D] dark:text-emerald-400 shrink-0 mt-0.5" />
+              <div>
+                <p className="text-sm font-semibold text-stone-900 dark:text-stone-100">
+                  Déduplication SHA-256 — Ouvrage déjà présent dans vos archives
+                </p>
+                <p className="text-xs text-stone-600 dark:text-stone-400 mt-0.5">
+                  {deduplicationNotice.message}
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-3 shrink-0">
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenBook(deduplicationNotice.book.id);
+                  dismissDeduplicationNotice();
+                }}
+                className="px-3 py-1.5 text-xs font-semibold text-white bg-[#9A3412] hover:bg-[#7C2D12] transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Ouvrir le livre
+              </button>
+              <button
+                type="button"
+                onClick={dismissDeduplicationNotice}
+                aria-label="Fermer la notification de déduplication"
+                className="p-1 text-stone-400 hover:text-stone-900 dark:hover:text-stone-100 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Upload Dropzone Drawer */}
         <PdfDropzone
           isOpen={isDropzoneOpen}
@@ -130,18 +173,18 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
             <div className="lg:col-span-8 flex flex-col justify-between">
               <div>
                 <p className="text-xs uppercase tracking-widest text-stone-500 dark:text-stone-400 mb-3">
-                  LECTURE EN COURS · ARCHIVES LOCALES HAUTE RÉSOLUTION
+                  LECTURE EN COURS · STOCKAGE PAR BLOCS INDEXEDDB & PWA HORS-LIGNE
                 </p>
                 <h1 className="font-serif text-3xl sm:text-5xl font-semibold text-stone-900 dark:text-stone-100 leading-[1.12]">
                   {featuredBook.title}
                 </h1>
                 <p className="text-base sm:text-lg text-stone-600 dark:text-stone-400 mt-3 max-w-2xl leading-relaxed">
-                  Par <span className="text-stone-900 dark:text-stone-200 font-medium">{featuredBook.author}</span>. Reprenez exactement votre lecture là où vous l’aviez interrompue avec préchargement instantané des pages et thèmes optiques calibrés.
+                  Par <span className="text-stone-900 dark:text-stone-200 font-medium">{featuredBook.author}</span>. Reprenez exactement votre lecture là où vous l’aviez interrompue avec préchargement instantané des pages, recadrage intelligent des marges et thèmes optiques calibrés.
                 </p>
               </div>
 
               <div className="mt-8 pt-6 border-t border-stone-200/80 dark:border-stone-800/80 flex flex-wrap items-center justify-between gap-6">
-                <div className="flex items-center gap-3 text-xs text-stone-600 dark:text-stone-400 font-mono tabular-nums">
+                <div className="flex items-center flex-wrap gap-3 text-xs text-stone-600 dark:text-stone-400 font-mono tabular-nums">
                   <span>
                     Page actuelle : {featuredBook.currentPage} sur {featuredBook.totalPages}
                   </span>
@@ -151,6 +194,14 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                   <span>
                     {featuredBook.bookmarksCount} signet{featuredBook.bookmarksCount > 1 ? 's' : ''}
                   </span>
+                  {featuredBook.chunkCount !== undefined && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        {featuredBook.chunkCount} bloc{featuredBook.chunkCount > 1 ? 's' : ''} binaire{featuredBook.chunkCount > 1 ? 's' : ''}
+                      </span>
+                    </>
+                  )}
                 </div>
 
                 <div className="flex items-center gap-3">
@@ -197,7 +248,7 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
           </section>
         )}
 
-        {/* Workspace Toolbar: Search, Mobile Filter Tabs, and Theme Toggle */}
+        {/* Workspace Toolbar: Search, Mobile Filter Tabs, PWA Install, and Theme Toggle */}
         <section
           aria-label="Outils de filtrage et recherche"
           className="mb-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4"
@@ -242,6 +293,9 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
                 className="w-full pl-9 pr-3 py-2 text-xs bg-white dark:bg-stone-900 border border-stone-300 dark:border-stone-800 text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none focus:border-[#9A3412] dark:focus:border-amber-500 transition-colors"
               />
             </div>
+
+            {/* In-App PWA Install & Offline Status */}
+            <PWAInstallControl />
 
             {/* Quiet UI surface mode button */}
             <button
@@ -345,10 +399,10 @@ export const LibraryView: React.FC<LibraryViewProps> = ({
       {/* Quiet Editorial Footer */}
       <footer className="border-t border-stone-200/80 dark:border-stone-800 py-6 px-6 lg:px-12 text-xs text-stone-500 dark:text-stone-400 flex flex-col sm:flex-row items-center justify-between gap-4">
         <span>
-          Folio — Liseuse numérique PDF haute résolution · Stockage persistant IndexedDB
+          Folio — Liseuse numérique PDF · Stockage par blocs IndexedDB, Déduplication SHA-256 & Mode PWA Hors-Ligne
         </span>
         <span className="font-mono tabular-nums">
-          Raccourcis lecture : Flèches ←/→ · Espace · Touche B (Signet)
+          Raccourcis : Flèches ←/→ · Espace · Touche B (Signet) · Touche C (Recadrage marges)
         </span>
       </footer>
     </div>

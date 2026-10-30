@@ -15,20 +15,28 @@ import { IBookRepository } from '../domain/repositories/IBookRepository';
 import { IPdfEngine } from '../domain/services/IPdfEngine';
 import {
   ALLOWED_PDF_MIME_TYPE,
+  computeSha256Hex,
   MAX_PDF_FILE_SIZE_BYTES,
+  PDF_CHUNK_SIZE_BYTES,
 } from '../domain/services/ReadingRules';
 import {
   buildSyntheticPdfBlob,
   CURATED_SEED_BOOKS,
 } from '../infrastructure/pdf/SamplePdfGenerator';
 
-const SEED_COMPLETED_STORAGE_KEY = 'folio_curated_library_seeded_v2';
+const SEED_COMPLETED_STORAGE_KEY = 'folio_curated_library_seeded_v3';
 
 export type LibraryFilter = 'all' | 'in_progress' | 'completed' | 'bookmarked';
+
+export interface DeduplicationNotice {
+  readonly book: Book;
+  readonly message: string;
+}
 
 export interface UseLibraryResult {
   readonly libraryState: AsyncState<readonly BookWithProgress[]>;
   readonly uploadState: AsyncState<Book>;
+  readonly deduplicationNotice: DeduplicationNotice | null;
   readonly activeFilter: LibraryFilter;
   readonly searchQuery: string;
   readonly filteredBooks: readonly BookWithProgress[];
@@ -38,6 +46,7 @@ export interface UseLibraryResult {
   readonly deleteBook: (bookId: string) => Promise<void>;
   readonly restoreSampleBooks: () => Promise<void>;
   readonly dismissUploadError: () => void;
+  readonly dismissDeduplicationNotice: () => void;
   readonly refreshLibrary: () => Promise<void>;
 }
 
@@ -55,6 +64,9 @@ export function useLibrary(
   const [uploadState, setUploadState] = useState<AsyncState<Book>>({
     status: 'idle',
   });
+
+  const [deduplicationNotice, setDeduplicationNotice] =
+    useState<DeduplicationNotice | null>(null);
 
   const [activeFilter, setActiveFilter] = useState<LibraryFilter>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -74,9 +86,17 @@ export function useLibrary(
         for (let i = 0; i < CURATED_SEED_BOOKS.length; i++) {
           const spec = CURATED_SEED_BOOKS[i];
           const pdfBlob = buildSyntheticPdfBlob(spec);
+          const buffer = await pdfBlob.arrayBuffer();
+          const contentHash = await computeSha256Hex(buffer);
+
           const extracted = await pdfEngine.extractCoverAndMetadata(
             pdfBlob,
             spec.title
+          );
+
+          const chunkCount = Math.max(
+            1,
+            Math.ceil(pdfBlob.size / PDF_CHUNK_SIZE_BYTES)
           );
 
           const book: Book = {
@@ -86,6 +106,8 @@ export function useLibrary(
             totalPages: extracted.totalPages,
             coverDataUrl: extracted.coverDataUrl,
             fileSizeBytes: pdfBlob.size,
+            contentHash,
+            chunkCount,
             addedAt: now - (CURATED_SEED_BOOKS.length - i) * 3600_000,
             lastReadAt: i === 0 ? now - 600_000 : null,
           };
@@ -125,6 +147,8 @@ export function useLibrary(
 
   const uploadPdfFile = useCallback(
     async (file: File): Promise<Book | null> => {
+      setDeduplicationNotice(null);
+
       // 1. Validate MIME type and extension
       const isPdfMime = file.type === ALLOWED_PDF_MIME_TYPE;
       const isPdfExt = file.name.toLowerCase().endsWith('.pdf');
@@ -167,13 +191,38 @@ export function useLibrary(
 
       setUploadState({
         status: 'loading',
-        message: `Analyse et extraction de la couverture de « ${file.name} »…`,
+        message: `Calcul de l’empreinte SHA-256 et découpage en segments de « ${file.name} »…`,
       });
 
       try {
+        const buffer = await file.arrayBuffer();
+        const contentHash = await computeSha256Hex(buffer);
+
+        // 3. Check SHA-256 deduplication in IndexedDB
+        const existingBook = await repository.findBookByContentHash(contentHash);
+        if (existingBook) {
+          const existingSession = await repository.getReadingSession(
+            existingBook.id
+          );
+          await repository.updateReadingProgress(existingSession);
+          const updatedBooks = await repository.getAllBooksMetadata();
+          setLibraryState({ status: 'success', data: updatedBooks });
+          setUploadState({ status: 'success', data: existingBook });
+          setDeduplicationNotice({
+            book: existingBook,
+            message: `Empreinte SHA-256 identique détectée (${contentHash.slice(0, 12)}…). L’ouvrage « ${existingBook.title} » et vos signets existants ont été restaurés sans doublon.`,
+          });
+          return existingBook;
+        }
+
         const extracted = await pdfEngine.extractCoverAndMetadata(
           file,
           file.name
+        );
+
+        const chunkCount = Math.max(
+          1,
+          Math.ceil(file.size / PDF_CHUNK_SIZE_BYTES)
         );
 
         const newBook: Book = {
@@ -183,6 +232,8 @@ export function useLibrary(
           totalPages: extracted.totalPages,
           coverDataUrl: extracted.coverDataUrl,
           fileSizeBytes: file.size,
+          contentHash,
+          chunkCount,
           addedAt: Date.now(),
           lastReadAt: Date.now(),
         };
@@ -228,6 +279,10 @@ export function useLibrary(
     setUploadState({ status: 'idle' });
   }, []);
 
+  const dismissDeduplicationNotice = useCallback(() => {
+    setDeduplicationNotice(null);
+  }, []);
+
   const allBooks = libraryState.status === 'success' ? libraryState.data : [];
   const normalizedQuery = searchQuery.trim().toLowerCase();
 
@@ -251,6 +306,7 @@ export function useLibrary(
   return {
     libraryState,
     uploadState,
+    deduplicationNotice,
     activeFilter,
     searchQuery,
     filteredBooks,
@@ -260,6 +316,7 @@ export function useLibrary(
     deleteBook,
     restoreSampleBooks,
     dismissUploadError,
+    dismissDeduplicationNotice,
     refreshLibrary,
   };
 }

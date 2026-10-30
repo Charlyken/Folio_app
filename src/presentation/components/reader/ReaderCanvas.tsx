@@ -17,6 +17,7 @@ export interface ReaderCanvasProps {
   readonly zoomLevel: number;
   readonly theme: ReaderTheme;
   readonly viewMode: ReaderViewMode;
+  readonly autoCropMargins: boolean;
   readonly canGoPrevious: boolean;
   readonly canGoNext: boolean;
   readonly onPreviousPage: () => void;
@@ -27,12 +28,6 @@ export interface ReaderCanvasProps {
 const BASE_PAGE_SCALE_SINGLE = 0.88;
 const BASE_PAGE_SCALE_DOUBLE = 0.78;
 
-/**
- * Returns CSS filter classes for the PDF canvas according to the active Kindle theme:
- * - 'light': Pure crisp white paper (no filter)
- * - 'sepia': Warm Venetian parchment tint
- * - 'dark': Smart CSS inversion + hue-rotate for comfortable night reading on white-background PDFs
- */
 function getCanvasThemeFilterClass(theme: ReaderTheme): string {
   switch (theme) {
     case 'light':
@@ -50,6 +45,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
   zoomLevel,
   theme,
   viewMode,
+  autoCropMargins,
   canGoPrevious,
   canGoNext,
   onPreviousPage,
@@ -81,6 +77,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
         pageNumber: leftPageNumber,
         canvas,
         scale: effectiveScale,
+        autoCropMargins,
       })
       .catch((err: unknown) => {
         if (isCancelled) return;
@@ -95,7 +92,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
       isCancelled = true;
       documentHandle.cancelActiveRender(canvas);
     };
-  }, [documentHandle, leftPageNumber, effectiveScale]);
+  }, [documentHandle, leftPageNumber, effectiveScale, autoCropMargins]);
 
   // Render Right Page in Double-Page Book Spread Mode
   useEffect(() => {
@@ -116,6 +113,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
         pageNumber: rightPageNumber,
         canvas,
         scale: effectiveScale,
+        autoCropMargins,
       })
       .catch(() => {
         if (isCancelled) return;
@@ -125,7 +123,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
       isCancelled = true;
       documentHandle.cancelActiveRender(canvas);
     };
-  }, [documentHandle, rightPageNumber, effectiveScale]);
+  }, [documentHandle, rightPageNumber, effectiveScale, autoCropMargins]);
 
   // Clean up canvas pixel buffers on unmount
   useEffect(() => {
@@ -149,7 +147,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
 
   return (
     <div className="relative flex-1 w-full h-full flex items-center justify-center overflow-auto py-8 px-4 sm:px-12 select-none">
-      {/* Left Margin Page-Turn Zone (Kindle-style tap/click zone) */}
+      {/* Left Margin Page-Turn Zone */}
       <button
         type="button"
         onClick={onPreviousPage}
@@ -192,6 +190,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
                 ref={leftCanvasRef}
                 data-testid="reader-canvas-primary"
                 data-page-number={leftPageNumber}
+                data-auto-crop={String(autoCropMargins)}
                 className={`block transition-all duration-150 ${filterClass}`}
               />
               {viewMode === 'double' && rightPageNumber !== null && (
@@ -209,6 +208,7 @@ export const ReaderCanvas: React.FC<ReaderCanvasProps> = ({
                   ref={rightCanvasRef}
                   data-testid="reader-canvas-secondary"
                   data-page-number={rightPageNumber}
+                  data-auto-crop={String(autoCropMargins)}
                   className={`block transition-all duration-150 ${filterClass}`}
                 />
                 <div

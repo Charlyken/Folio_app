@@ -10,6 +10,7 @@ import { createAppError } from '../../domain/entities/AsyncState';
 import {
   IPdfDocumentHandle,
   IPdfEngine,
+  PdfChunkedSource,
   PdfDocumentMetadata,
   PdfOutlineItem,
   RenderPageOptions,
@@ -20,7 +21,9 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const COVER_THUMBNAIL_SCALE = 0.75;
 const COVER_JPEG_QUALITY = 0.85;
-const MAX_CACHED_PREFETCH_PAGES = 3;
+const MAX_CACHED_PREFETCH_PAGES = 4;
+const MAX_CACHED_THUMBNAILS = 24;
+const AUTO_CROP_MARGIN_RATIO = 0.085; // Trim 8.5% outer academic margins when Auto-Crop is active
 
 interface RawPdfMetadataInfo {
   Title?: string;
@@ -37,6 +40,7 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
   private readonly pdfDoc: PDFDocumentProxy;
   private readonly activeRenderTasks = new WeakMap<HTMLCanvasElement, RenderTask>();
   private readonly pageCache = new Map<number, PDFPageProxy>();
+  private readonly thumbnailCache = new Map<string, string>();
 
   constructor(pdfDoc: PDFDocumentProxy) {
     this.pdfDoc = pdfDoc;
@@ -74,7 +78,6 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
     }
 
     const page = await this.pdfDoc.getPage(clamped);
-    // Evict oldest cached page if cache exceeds budget (strict Memory Management)
     if (this.pageCache.size >= MAX_CACHED_PREFETCH_PAGES) {
       const oldestKey = this.pageCache.keys().next().value;
       if (oldestKey !== undefined) {
@@ -111,15 +114,19 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
   }
 
   public async renderPageToCanvas(options: RenderPageOptions): Promise<void> {
-    const { pageNumber, canvas, scale } = options;
+    const { pageNumber, canvas, scale, autoCropMargins = false } = options;
     const dpr = options.devicePixelRatio ?? Math.min(window.devicePixelRatio || 1, 2.5);
 
-    // Cancel any ongoing render on this specific canvas before starting a new one
     this.cancelActiveRender(canvas);
 
     const page = await this.getOrLoadPage(pageNumber);
+
+    // When Auto-Crop is enabled, zoom into the central printable area by trimming outer margins
+    const cropZoomBoost = autoCropMargins ? 1 / (1 - AUTO_CROP_MARGIN_RATIO * 2) : 1;
+    const effectiveScale = scale * cropZoomBoost;
+
     const cssViewport = page.getViewport({ scale });
-    const outputViewport = page.getViewport({ scale: scale * dpr });
+    const fullRenderViewport = page.getViewport({ scale: effectiveScale * dpr });
 
     const context = canvas.getContext('2d', { alpha: false });
     if (!context) {
@@ -130,20 +137,31 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
       );
     }
 
-    // Set physical HiDPI / Retina pixel dimensions
-    canvas.width = Math.floor(outputViewport.width);
-    canvas.height = Math.floor(outputViewport.height);
-    // Set CSS display dimensions
+    canvas.width = Math.floor(cssViewport.width * dpr);
+    canvas.height = Math.floor(cssViewport.height * dpr);
     canvas.style.width = `${Math.floor(cssViewport.width)}px`;
     canvas.style.height = `${Math.floor(cssViewport.height)}px`;
 
-    // Clear with clean white paper background before rendering PDF glyphs
+    context.save();
     context.fillStyle = '#FFFFFF';
     context.fillRect(0, 0, canvas.width, canvas.height);
 
+    // Offset viewport origin when autoCropMargins is enabled so outer margins are cropped out
+    const offsetX = autoCropMargins
+      ? -Math.floor(fullRenderViewport.width * AUTO_CROP_MARGIN_RATIO)
+      : 0;
+    const offsetY = autoCropMargins
+      ? -Math.floor(fullRenderViewport.height * AUTO_CROP_MARGIN_RATIO)
+      : 0;
+
+    const croppedViewport = fullRenderViewport.clone({
+      offsetX,
+      offsetY,
+    });
+
     const renderTask = page.render({
       canvasContext: context,
-      viewport: outputViewport,
+      viewport: croppedViewport,
       canvas,
     });
 
@@ -154,7 +172,6 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
     } catch (err: unknown) {
       const errorObj = err as { name?: string };
       if (errorObj?.name === 'RenderingCancelledException') {
-        // Expected when user flips pages rapidly
         return;
       }
       throw createAppError(
@@ -163,9 +180,60 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
         `La page ${pageNumber} n’a pas pu être affichée correctement.`
       );
     } finally {
+      context.restore();
       if (this.activeRenderTasks.get(canvas) === renderTask) {
         this.activeRenderTasks.delete(canvas);
       }
+    }
+  }
+
+  public async renderPageThumbnail(
+    pageNumber: number,
+    targetWidth = 136
+  ): Promise<string> {
+    const clamped = Math.max(1, Math.min(pageNumber, this.pdfDoc.numPages));
+    const cacheKey = `${clamped}:${targetWidth}`;
+    const existing = this.thumbnailCache.get(cacheKey);
+    if (existing) {
+      return existing;
+    }
+
+    const page = await this.getOrLoadPage(clamped);
+    const unscaledViewport = page.getViewport({ scale: 1 });
+    const scale = targetWidth / Math.max(1, unscaledViewport.width);
+    const thumbViewport = page.getViewport({ scale });
+
+    const offscreen = document.createElement('canvas');
+    offscreen.width = Math.max(1, Math.floor(thumbViewport.width));
+    offscreen.height = Math.max(1, Math.floor(thumbViewport.height));
+
+    try {
+      const ctx = offscreen.getContext('2d', { alpha: false });
+      if (!ctx) return '';
+
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, offscreen.width, offscreen.height);
+
+      await page.render({
+        canvasContext: ctx,
+        viewport: thumbViewport,
+        canvas: offscreen,
+      }).promise;
+
+      const dataUrl = offscreen.toDataURL('image/jpeg', 0.78);
+      if (this.thumbnailCache.size >= MAX_CACHED_THUMBNAILS) {
+        const oldest = this.thumbnailCache.keys().next().value;
+        if (oldest !== undefined) {
+          this.thumbnailCache.delete(oldest);
+        }
+      }
+      this.thumbnailCache.set(cacheKey, dataUrl);
+      return dataUrl;
+    } catch {
+      return '';
+    } finally {
+      offscreen.width = 0;
+      offscreen.height = 0;
     }
   }
 
@@ -219,7 +287,9 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
         return Math.max(1, Math.min(ref + 1, this.pdfDoc.numPages));
       }
       if (typeof ref === 'object' && ref !== null) {
-        const pageIndex = await this.pdfDoc.getPageIndex(ref as Parameters<PDFDocumentProxy['getPageIndex']>[0]);
+        const pageIndex = await this.pdfDoc.getPageIndex(
+          ref as Parameters<PDFDocumentProxy['getPageIndex']>[0]
+        );
         return Math.max(1, Math.min(pageIndex + 1, this.pdfDoc.numPages));
       }
       return 1;
@@ -237,6 +307,7 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
       }
     }
     this.pageCache.clear();
+    this.thumbnailCache.clear();
     try {
       await this.pdfDoc.cleanup();
       const docWithDestroy = this.pdfDoc as unknown as {
@@ -251,9 +322,47 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
   }
 }
 
+function isChunkedSource(
+  source: Blob | ArrayBuffer | PdfChunkedSource
+): source is PdfChunkedSource {
+  return (
+    typeof source === 'object' &&
+    source !== null &&
+    'length' in source &&
+    'getRange' in source &&
+    typeof (source as PdfChunkedSource).getRange === 'function'
+  );
+}
+
 export class PdfJsAdapter implements IPdfEngine {
-  public async loadDocument(source: Blob | ArrayBuffer): Promise<IPdfDocumentHandle> {
+  public async loadDocument(
+    source: Blob | ArrayBuffer | PdfChunkedSource
+  ): Promise<IPdfDocumentHandle> {
     try {
+      if (isChunkedSource(source)) {
+        // Use PDFDataRangeTransport for streaming chunked ranges from IndexedDB
+        const RangeTransportClass = pdfjsLib.PDFDataRangeTransport;
+        const transport = new RangeTransportClass(source.length, new Uint8Array(0));
+        transport.requestDataRange = (begin: number, end: number) => {
+          void source
+            .getRange(begin, end)
+            .then((chunkBytes) => {
+              transport.onDataRange(begin, chunkBytes);
+            })
+            .catch(() => {
+              // Range error handled by loading task
+            });
+        };
+
+        const loadingTask = pdfjsLib.getDocument({
+          range: transport,
+          cMapPacked: true,
+        });
+
+        const pdfDoc = await loadingTask.promise;
+        return new PdfJsDocumentHandle(pdfDoc);
+      }
+
       const buffer =
         source instanceof Blob ? await source.arrayBuffer() : source.slice(0);
       const loadingTask = pdfjsLib.getDocument({
@@ -320,7 +429,6 @@ export class PdfJsAdapter implements IPdfEngine {
         coverDataUrl,
       };
     } finally {
-      // Strictly clean up offscreen canvas memory and destroy temporary PDF document handle
       offscreenCanvas.width = 0;
       offscreenCanvas.height = 0;
       await handle.destroy();

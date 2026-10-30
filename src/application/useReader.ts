@@ -26,16 +26,20 @@ import {
 import {
   calculateProgressPercentage,
   calculateRemainingPercentage,
-  clampZoomLevel,
+  estimateReadingTimeRemaining,
+  generateReadingNotesMarkdown,
   getNextPageNumber,
   getPrefetchPageNumber,
   getPreviousPageNumber,
   getVisiblePageNumbers,
   normalizeTargetPage,
+  parseStudySheetJson,
   resetZoom,
+  serializeStudySheetJson,
   stepZoomIn,
   stepZoomOut,
   togglePageBookmark,
+  updateRollingReadingPace,
 } from '../domain/services/ReadingRules';
 
 const PROGRESS_SAVE_DEBOUNCE_MS = 350;
@@ -52,6 +56,7 @@ export interface UseReaderResult {
   readonly visiblePages: readonly number[];
   readonly progressPercentage: number;
   readonly remainingPercentage: number;
+  readonly readingTimeSummary: string;
   readonly isCurrentPageBookmarked: boolean;
   readonly canGoPrevious: boolean;
   readonly canGoNext: boolean;
@@ -60,6 +65,7 @@ export interface UseReaderResult {
   readonly goToPage: (pageNumber: number) => void;
   readonly setTheme: (theme: ReaderTheme) => void;
   readonly setViewMode: (viewMode: ReaderViewMode) => void;
+  readonly toggleAutoCropMargins: () => void;
   readonly zoomIn: () => void;
   readonly zoomOut: () => void;
   readonly resetZoomLevel: () => void;
@@ -67,6 +73,12 @@ export interface UseReaderResult {
   readonly toggleBookmarkOnPage: (pageNumber: number) => void;
   readonly addAnnotation: (note: string, color?: ReaderAnnotation['color']) => void;
   readonly removeAnnotation: (annotationId: string) => void;
+  readonly exportNotesAsMarkdown: () => void;
+  readonly exportNotesAsJson: () => void;
+  readonly importNotesFromJson: (rawJson: string) => {
+    readonly success: boolean;
+    readonly message: string;
+  };
 }
 
 export function useReader(
@@ -87,6 +99,9 @@ export function useReader(
   const saveTimerRef = useRef<number | null>(null);
   const latestSessionRef = useRef<ReadingSession>(session);
   latestSessionRef.current = session;
+
+  // Track timestamp when user arrived on the current page for reading speed calculation
+  const pageEnteredAtRef = useRef<number>(Date.now());
 
   // Load book metadata, reading session, and binary PDF document
   useEffect(() => {
@@ -140,6 +155,7 @@ export function useReader(
           currentPage: normalizedStartPage,
         };
 
+        pageEnteredAtRef.current = Date.now();
         setSession(hydratedSession);
         setReaderState({
           status: 'success',
@@ -177,7 +193,6 @@ export function useReader(
         window.clearTimeout(saveTimerRef.current);
         saveTimerRef.current = null;
       }
-      // Flush latest reading session immediately on unmount
       void repository.updateReadingProgress(latestSessionRef.current);
 
       if (activeHandleRef.current) {
@@ -188,7 +203,6 @@ export function useReader(
     };
   }, [bookId, repository, pdfEngine]);
 
-  // Debounced auto-save of reading session + prefetch page N+1
   const scheduleSessionPersistence = useCallback(
     (nextSession: ReadingSession) => {
       if (saveTimerRef.current !== null) {
@@ -231,37 +245,48 @@ export function useReader(
     [scheduleSessionPersistence]
   );
 
+  const recordDwellAndNavigate = useCallback(
+    (computeNextPage: (prev: ReadingSession) => number) => {
+      const now = Date.now();
+      const dwellSeconds = (now - pageEnteredAtRef.current) / 1000;
+      pageEnteredAtRef.current = now;
+
+      updateSession((prev) => {
+        const nextPage = computeNextPage(prev);
+        const updatedPace =
+          nextPage !== prev.currentPage
+            ? updateRollingReadingPace(prev.averageSecondsPerPage, dwellSeconds)
+            : prev.averageSecondsPerPage;
+        return {
+          ...prev,
+          currentPage: nextPage,
+          averageSecondsPerPage: updatedPace,
+        };
+      });
+    },
+    [updateSession]
+  );
+
   const goToPage = useCallback(
     (targetPage: number) => {
-      updateSession((prev) => ({
-        ...prev,
-        currentPage: normalizeTargetPage(targetPage, totalPages, prev.viewMode),
-      }));
+      recordDwellAndNavigate((prev) =>
+        normalizeTargetPage(targetPage, totalPages, prev.viewMode)
+      );
     },
-    [totalPages, updateSession]
+    [totalPages, recordDwellAndNavigate]
   );
 
   const goToNextPage = useCallback(() => {
-    updateSession((prev) => ({
-      ...prev,
-      currentPage: getNextPageNumber(
-        prev.currentPage,
-        totalPages,
-        prev.viewMode
-      ),
-    }));
-  }, [totalPages, updateSession]);
+    recordDwellAndNavigate((prev) =>
+      getNextPageNumber(prev.currentPage, totalPages, prev.viewMode)
+    );
+  }, [totalPages, recordDwellAndNavigate]);
 
   const goToPreviousPage = useCallback(() => {
-    updateSession((prev) => ({
-      ...prev,
-      currentPage: getPreviousPageNumber(
-        prev.currentPage,
-        totalPages,
-        prev.viewMode
-      ),
-    }));
-  }, [totalPages, updateSession]);
+    recordDwellAndNavigate((prev) =>
+      getPreviousPageNumber(prev.currentPage, totalPages, prev.viewMode)
+    );
+  }, [totalPages, recordDwellAndNavigate]);
 
   const setTheme = useCallback(
     (theme: ReaderTheme) => {
@@ -284,6 +309,13 @@ export function useReader(
     },
     [totalPages, updateSession]
   );
+
+  const toggleAutoCropMargins = useCallback(() => {
+    updateSession((prev) => ({
+      ...prev,
+      autoCropMargins: !prev.autoCropMargins,
+    }));
+  }, [updateSession]);
 
   const zoomIn = useCallback(() => {
     updateSession((prev) => ({
@@ -350,7 +382,96 @@ export function useReader(
     [updateSession]
   );
 
-  // Keyboard shortcuts: ArrowRight / Space -> next page, ArrowLeft -> previous page
+  const triggerBrowserDownload = useCallback(
+    (content: string, filename: string, mimeType: string) => {
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(url);
+    },
+    []
+  );
+
+  const exportNotesAsMarkdown = useCallback(() => {
+    if (readerState.status !== 'success') return;
+    const { book, outline } = readerState.data;
+    const markdown = generateReadingNotesMarkdown(
+      book,
+      session.bookmarks,
+      session.annotations,
+      outline
+    );
+    const safeSlug = book.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-|-$/g, '');
+    triggerBrowserDownload(
+      markdown,
+      `fiche-lecture-${safeSlug || 'folio'}.md`,
+      'text/markdown;charset=utf-8'
+    );
+  }, [readerState, session.bookmarks, session.annotations, triggerBrowserDownload]);
+
+  const exportNotesAsJson = useCallback(() => {
+    if (readerState.status !== 'success') return;
+    const { book } = readerState.data;
+    const json = serializeStudySheetJson(
+      book.title,
+      session.bookmarks,
+      session.annotations
+    );
+    const safeSlug = book.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, '-')
+      .replace(/^-|-$/g, '');
+    triggerBrowserDownload(
+      json,
+      `notes-${safeSlug || 'folio'}.json`,
+      'application/json;charset=utf-8'
+    );
+  }, [readerState, session.bookmarks, session.annotations, triggerBrowserDownload]);
+
+  const importNotesFromJson = useCallback(
+    (rawJson: string): { readonly success: boolean; readonly message: string } => {
+      try {
+        const imported = parseStudySheetJson(rawJson, totalPages);
+        updateSession((prev) => {
+          const mergedBookmarks = Array.from(
+            new Set([...prev.bookmarks, ...imported.bookmarks])
+          ).sort((a, b) => a - b);
+
+          const existingIds = new Set(prev.annotations.map((a) => a.id));
+          const newNotes = imported.annotations.filter(
+            (a) => !existingIds.has(a.id)
+          );
+
+          return {
+            ...prev,
+            bookmarks: mergedBookmarks,
+            annotations: [...newNotes, ...prev.annotations],
+          };
+        });
+        return {
+          success: true,
+          message: `${imported.bookmarks.length} signet(s) et ${imported.annotations.length} note(s) importés avec succès.`,
+        };
+      } catch {
+        return {
+          success: false,
+          message:
+            'Le fichier JSON sélectionné ne correspond pas au format de fiche de lecture Folio.',
+        };
+      }
+    },
+    [totalPages, updateSession]
+  );
+
+  // Keyboard shortcuts: ArrowRight / Space -> next page, ArrowLeft -> previous page, B -> bookmark, C -> Auto-crop
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -391,6 +512,11 @@ export function useReader(
           event.preventDefault();
           toggleBookmarkOnCurrentPage();
         }
+      } else if (event.key === 'c' || event.key === 'C') {
+        if (!event.ctrlKey && !event.metaKey) {
+          event.preventDefault();
+          toggleAutoCropMargins();
+        }
       }
     }
 
@@ -404,6 +530,7 @@ export function useReader(
     zoomIn,
     zoomOut,
     toggleBookmarkOnCurrentPage,
+    toggleAutoCropMargins,
   ]);
 
   const visiblePages = getVisiblePageNumbers(
@@ -411,7 +538,8 @@ export function useReader(
     totalPages,
     session.viewMode
   );
-  const lastVisiblePage = visiblePages[visiblePages.length - 1] ?? session.currentPage;
+  const lastVisiblePage =
+    visiblePages[visiblePages.length - 1] ?? session.currentPage;
 
   const progressPercentage = calculateProgressPercentage(
     lastVisiblePage,
@@ -421,6 +549,16 @@ export function useReader(
     lastVisiblePage,
     totalPages
   );
+
+  const outline =
+    readerState.status === 'success' ? readerState.data.outline : [];
+
+  const readingTimeSummary = estimateReadingTimeRemaining(
+    lastVisiblePage,
+    totalPages,
+    outline,
+    session.averageSecondsPerPage
+  ).formattedSummary;
 
   const isCurrentPageBookmarked = visiblePages.some((p) =>
     session.bookmarks.includes(p)
@@ -435,6 +573,7 @@ export function useReader(
     visiblePages,
     progressPercentage,
     remainingPercentage,
+    readingTimeSummary,
     isCurrentPageBookmarked,
     canGoPrevious,
     canGoNext,
@@ -443,6 +582,7 @@ export function useReader(
     goToPage,
     setTheme,
     setViewMode,
+    toggleAutoCropMargins,
     zoomIn,
     zoomOut,
     resetZoomLevel,
@@ -450,5 +590,8 @@ export function useReader(
     toggleBookmarkOnPage,
     addAnnotation,
     removeAnnotation,
+    exportNotesAsMarkdown,
+    exportNotesAsJson,
+    importNotesFromJson,
   };
 }

@@ -20,6 +20,7 @@ export interface RenderPageOptions {
   readonly canvas: HTMLCanvasElement;
   readonly scale: number;
   readonly devicePixelRatio?: number;
+  readonly autoCropMargins?: boolean;
 }
 
 export interface IPdfDocumentHandle {
@@ -27,16 +28,22 @@ export interface IPdfDocumentHandle {
   getMetadata(): Promise<PdfDocumentMetadata>;
   extractOutline(): Promise<PdfOutlineItem[]>;
   renderPageToCanvas(options: RenderPageOptions): Promise<void>;
+  renderPageThumbnail(pageNumber: number, targetWidth?: number): Promise<string>;
   prefetchPage(pageNumber: number): Promise<void>;
   cancelActiveRender(canvas: HTMLCanvasElement): void;
   destroy(): Promise<void>;
 }
 
+export interface PdfChunkedSource {
+  readonly length: number;
+  readonly getRange: (begin: number, end: number) => Promise<Uint8Array>;
+}
+
 export interface IPdfEngine {
   /**
-   * Loads a PDF document from a Blob or ArrayBuffer and returns an isolated handle.
+   * Loads a PDF document from a Blob, ArrayBuffer, or chunked range provider and returns an isolated handle.
    */
-  loadDocument(source: Blob | ArrayBuffer): Promise<IPdfDocumentHandle>;
+  loadDocument(source: Blob | ArrayBuffer | PdfChunkedSource): Promise<IPdfDocumentHandle>;
 
   /**
    * Generates a cover thumbnail data URL and extracts metadata from page 1 using an offscreen canvas.
