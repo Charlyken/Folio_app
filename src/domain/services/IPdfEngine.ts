@@ -15,6 +15,15 @@ export interface PdfDocumentMetadata {
   readonly totalPages: number;
 }
 
+export interface PdfTextSpanItem {
+  readonly str: string;
+  readonly xRatio: number; // Normalized [0..1] from left edge of viewport
+  readonly yRatio: number; // Normalized [0..1] from top edge of viewport
+  readonly widthRatio: number; // Normalized [0..1] width
+  readonly heightRatio: number; // Normalized [0..1] height
+  readonly fontSizeRatio: number; // Normalized font height relative to page height
+}
+
 export interface RenderPageOptions {
   readonly pageNumber: number;
   readonly canvas: HTMLCanvasElement;
@@ -29,6 +38,11 @@ export interface IPdfDocumentHandle {
   extractOutline(): Promise<PdfOutlineItem[]>;
   renderPageToCanvas(options: RenderPageOptions): Promise<void>;
   renderPageThumbnail(pageNumber: number, targetWidth?: number): Promise<string>;
+  getPageTextItems(
+    pageNumber: number,
+    autoCropMargins?: boolean
+  ): Promise<readonly PdfTextSpanItem[]>;
+  extractAllPagesPlainText(): Promise<readonly { readonly pageNumber: number; readonly text: string }[]>;
   prefetchPage(pageNumber: number): Promise<void>;
   cancelActiveRender(canvas: HTMLCanvasElement): void;
   destroy(): Promise<void>;
@@ -46,7 +60,7 @@ export interface IPdfEngine {
   loadDocument(source: Blob | ArrayBuffer | PdfChunkedSource): Promise<IPdfDocumentHandle>;
 
   /**
-   * Generates a cover thumbnail data URL and extracts metadata from page 1 using an offscreen canvas.
+   * Generates a cover thumbnail data URL, extracts metadata, and extracts plain text of all pages for full-text indexing.
    */
   extractCoverAndMetadata(
     source: Blob | ArrayBuffer,
@@ -56,5 +70,6 @@ export interface IPdfEngine {
     readonly author: string;
     readonly totalPages: number;
     readonly coverDataUrl: string;
+    readonly pagesText: readonly { readonly pageNumber: number; readonly text: string }[];
   }>;
 }

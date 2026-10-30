@@ -5,13 +5,31 @@
 
 export type ReaderTheme = 'light' | 'sepia' | 'dark';
 export type ReaderViewMode = 'single' | 'double';
+export type HighlightColor = 'amber' | 'terracotta' | 'lapis';
+
+export interface HighlightRect {
+  readonly xRatio: number; // Normalized [0..1] relative to page width
+  readonly yRatio: number; // Normalized [0..1] relative to page height
+  readonly widthRatio: number; // Normalized [0..1]
+  readonly heightRatio: number; // Normalized [0..1]
+}
+
+export interface ReaderHighlight {
+  readonly id: string;
+  readonly pageNumber: number;
+  readonly text: string;
+  readonly color: HighlightColor;
+  readonly rects: readonly HighlightRect[];
+  readonly createdAt: number;
+}
 
 export interface ReaderAnnotation {
   readonly id: string;
   readonly pageNumber: number;
   readonly note: string;
+  readonly quotedText?: string;
   readonly createdAt: number;
-  readonly color: 'amber' | 'terracotta' | 'lapis';
+  readonly color: HighlightColor;
 }
 
 export interface ReadingSession {
@@ -24,6 +42,7 @@ export interface ReadingSession {
   readonly averageSecondsPerPage: number;
   readonly bookmarks: readonly number[];
   readonly annotations: readonly ReaderAnnotation[];
+  readonly highlights: readonly ReaderHighlight[];
   readonly updatedAt: number;
 }
 
@@ -44,6 +63,7 @@ export function createInitialReadingSession(bookId: string): ReadingSession {
     averageSecondsPerPage: DEFAULT_SECONDS_PER_PAGE,
     bookmarks: [],
     annotations: [],
+    highlights: [],
     updatedAt: Date.now(),
   };
 }

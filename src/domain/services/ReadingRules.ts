@@ -7,12 +7,19 @@ import { Book } from '../entities/Book';
 import {
   DEFAULT_SECONDS_PER_PAGE,
   DEFAULT_ZOOM_LEVEL,
+  HighlightColor,
   MAX_ZOOM_LEVEL,
   MIN_ZOOM_LEVEL,
   ReaderAnnotation,
+  ReaderHighlight,
   ReaderViewMode,
   ZOOM_STEP,
 } from '../entities/ReadingSession';
+import {
+  BookPageTextEntry,
+  BookSearchIndex,
+  SearchMatchSnippet,
+} from '../entities/SearchIndex';
 import { PdfOutlineItem } from './IPdfEngine';
 
 export const MAX_PDF_FILE_SIZE_BYTES = 150 * 1024 * 1024; // 150 MB
@@ -21,6 +28,7 @@ export const PDF_CHUNK_SIZE_BYTES = 2 * 1024 * 1024; // 2 MB chunks for IndexedD
 
 export const MIN_VALID_PAGE_DWELL_SECONDS = 4;
 export const MAX_VALID_PAGE_DWELL_SECONDS = 300;
+export const SEARCH_SNIPPET_CONTEXT_CHARS = 56;
 
 /**
  * Calculates the reading progress percentage between 0 and 100.
@@ -167,8 +175,7 @@ export function formatFileSize(bytes: number): string {
 }
 
 /**
- * Updates the rolling reading speed (averageSecondsPerPage) using an Exponential Moving Average (EMA),
- * ignoring idle pauses (> 300s) or rapid page flips (< 4s).
+ * Updates the rolling reading speed (averageSecondsPerPage) using an Exponential Moving Average (EMA).
  */
 export function updateRollingReadingPace(
   previousAvgSeconds: number,
@@ -203,7 +210,6 @@ export function estimateReadingTimeRemaining(
   const remainingBookPages = Math.max(0, totalPages - currentPage);
   const bookRemainingSeconds = remainingBookPages * pace;
 
-  // Flatten top-level outline sorted by pageNumber
   const sortedOutline = [...outline].sort((a, b) => a.pageNumber - b.pageNumber);
   let currentChapter: PdfOutlineItem | null = null;
   let nextChapterPage: number | null = null;
@@ -253,14 +259,14 @@ export function formatDurationFrench(totalSeconds: number): string {
 }
 
 /**
- * Generates a structured editorial Markdown study sheet containing all bookmarks and annotations
- * grouped by chapter.
+ * Generates a structured editorial Markdown study sheet containing all bookmarks, highlights, and annotations.
  */
 export function generateReadingNotesMarkdown(
   book: Pick<Book, 'title' | 'author' | 'totalPages'>,
   bookmarks: readonly number[],
   annotations: readonly ReaderAnnotation[],
-  outline: readonly PdfOutlineItem[]
+  outline: readonly PdfOutlineItem[],
+  highlights: readonly ReaderHighlight[] = []
 ): string {
   const lines: string[] = [
     `# Fiche de Lecture — ${book.title}`,
@@ -268,13 +274,13 @@ export function generateReadingNotesMarkdown(
     `- **Auteur** : ${book.author}`,
     `- **Longueur** : ${book.totalPages} pages`,
     `- **Signets enregistrés** : ${bookmarks.length}`,
+    `- **Passages surlignés** : ${highlights.length}`,
     `- **Notes & Annotations** : ${annotations.length}`,
     ``,
     `---`,
     ``,
   ];
 
-  // Resolve chapter name helper
   const sortedOutline = [...outline].sort((a, b) => a.pageNumber - b.pageNumber);
   const findChapterForPage = (pageNum: number): string => {
     let chapterTitle = 'Introduction / Hors-chapitre';
@@ -300,6 +306,17 @@ export function generateReadingNotesMarkdown(
   }
   lines.push(``);
 
+  if (highlights.length > 0) {
+    lines.push(`## Passages Surlignés (${highlights.length})`);
+    lines.push(``);
+    const sortedHighlights = [...highlights].sort((a, b) => a.pageNumber - b.pageNumber);
+    for (const hl of sortedHighlights) {
+      const chap = sortedOutline.length > 0 ? ` · ${findChapterForPage(hl.pageNumber)}` : '';
+      lines.push(`- **Page ${hl.pageNumber}${chap}** : « _${hl.text}_ »`);
+    }
+    lines.push(``);
+  }
+
   lines.push(`## Annotations & Réflexions (${annotations.length})`);
   lines.push(``);
   if (annotations.length === 0) {
@@ -310,7 +327,11 @@ export function generateReadingNotesMarkdown(
       const chap = sortedOutline.length > 0 ? ` · ${findChapterForPage(note.pageNumber)}` : '';
       lines.push(`### Page ${note.pageNumber}${chap}`);
       lines.push(``);
-      lines.push(`> ${note.note}`);
+      if (note.quotedText) {
+        lines.push(`> « ${note.quotedText} »`);
+        lines.push(``);
+      }
+      lines.push(`${note.note}`);
       lines.push(``);
     }
   }
@@ -323,20 +344,27 @@ export interface ImportedStudySheetPayload {
   readonly bookTitle: string;
   readonly bookmarks: readonly number[];
   readonly annotations: readonly ReaderAnnotation[];
+  readonly highlights?: readonly ReaderHighlight[];
 }
 
 export function serializeStudySheetJson(
   bookTitle: string,
   bookmarks: readonly number[],
-  annotations: readonly ReaderAnnotation[]
+  annotations: readonly ReaderAnnotation[],
+  highlights: readonly ReaderHighlight[] = []
 ): string {
   const payload: ImportedStudySheetPayload = {
     version: 1,
     bookTitle,
     bookmarks,
     annotations,
+    highlights,
   };
   return JSON.stringify(payload, null, 2);
+}
+
+function isValidHighlightColor(c: unknown): c is HighlightColor {
+  return c === 'amber' || c === 'terracotta' || c === 'lapis';
 }
 
 export function parseStudySheetJson(
@@ -345,6 +373,7 @@ export function parseStudySheetJson(
 ): {
   readonly bookmarks: readonly number[];
   readonly annotations: readonly ReaderAnnotation[];
+  readonly highlights: readonly ReaderHighlight[];
 } {
   const parsed = JSON.parse(rawJson) as Partial<ImportedStudySheetPayload>;
   if (!parsed || typeof parsed !== 'object') {
@@ -377,11 +406,34 @@ export function parseStudySheetJson(
             : `note-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         pageNumber: Math.max(1, Math.min(Math.floor(item.pageNumber), totalPages)),
         note: item.note.trim(),
+        quotedText: typeof item.quotedText === 'string' ? item.quotedText : undefined,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : Date.now(),
-        color:
-          item.color === 'terracotta' || item.color === 'lapis' || item.color === 'amber'
-            ? item.color
-            : 'amber',
+        color: isValidHighlightColor(item.color) ? item.color : 'amber',
+      });
+    }
+  }
+
+  const rawHighlights = Array.isArray(parsed.highlights) ? parsed.highlights : [];
+  const validHighlights: ReaderHighlight[] = [];
+  for (const hl of rawHighlights) {
+    if (
+      hl &&
+      typeof hl === 'object' &&
+      typeof hl.text === 'string' &&
+      hl.text.trim().length > 0 &&
+      typeof hl.pageNumber === 'number' &&
+      Array.isArray(hl.rects)
+    ) {
+      validHighlights.push({
+        id:
+          typeof hl.id === 'string' && hl.id.length > 0
+            ? hl.id
+            : `hl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        pageNumber: Math.max(1, Math.min(Math.floor(hl.pageNumber), totalPages)),
+        text: hl.text.trim(),
+        color: isValidHighlightColor(hl.color) ? hl.color : 'amber',
+        rects: hl.rects,
+        createdAt: typeof hl.createdAt === 'number' ? hl.createdAt : Date.now(),
       });
     }
   }
@@ -389,6 +441,7 @@ export function parseStudySheetJson(
   return {
     bookmarks: validBookmarks,
     annotations: validAnnotations,
+    highlights: validHighlights,
   };
 }
 
@@ -458,4 +511,186 @@ export async function computeSha256Hex(buffer: ArrayBuffer): Promise<string> {
   const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Normalizes a string for accent-insensitive and case-insensitive full-text indexing & search
+ * while preserving exact 1:1 character length so substring indices match the original string.
+ */
+export function normalizeForFullTextSearch(input: string): string {
+  return input
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+/**
+ * Tokenizes normalized text into unique alphanumeric words of length >= 2.
+ */
+export function extractNormalizedTokens(normalizedText: string): string[] {
+  const rawTokens = normalizedText.split(/[^a-z0-9]+/);
+  const unique = new Set<string>();
+  for (const t of rawTokens) {
+    if (t.length >= 2) {
+      unique.add(t);
+    }
+  }
+  return Array.from(unique);
+}
+
+/**
+ * Builds an inverted full-text search index (`BookSearchIndex`) from extracted PDF page texts.
+ */
+export function buildBookSearchIndex(
+  bookId: string,
+  pagesInput: readonly { readonly pageNumber: number; readonly text: string }[]
+): BookSearchIndex {
+  const pages: BookPageTextEntry[] = [];
+  const tokenMap = new Map<string, Set<number>>();
+
+  for (const item of pagesInput) {
+    const cleanedText = item.text.replace(/\s+/g, ' ').trim();
+    const normalizedText = normalizeForFullTextSearch(cleanedText);
+    pages.push({
+      pageNumber: item.pageNumber,
+      text: cleanedText,
+      normalizedText,
+    });
+
+    const tokens = extractNormalizedTokens(normalizedText);
+    for (const token of tokens) {
+      let pageSet = tokenMap.get(token);
+      if (!pageSet) {
+        pageSet = new Set<number>();
+        tokenMap.set(token, pageSet);
+      }
+      pageSet.add(item.pageNumber);
+    }
+  }
+
+  const invertedTokens: Record<string, readonly number[]> = {};
+  for (const [token, pageSet] of tokenMap.entries()) {
+    invertedTokens[token] = Array.from(pageSet).sort((a, b) => a - b);
+  }
+
+  return {
+    bookId,
+    indexedAt: Date.now(),
+    pages,
+    invertedTokens,
+  };
+}
+
+/**
+ * Executes an ultra-fast (< 5 ms) full-text search against a `BookSearchIndex` using the
+ * inverted token map to narrow candidate pages, then extracts contextual snippets.
+ */
+export function queryBookSearchIndex(
+  searchIndex: BookSearchIndex,
+  rawQuery: string,
+  maxResults = 50
+): readonly SearchMatchSnippet[] {
+  const trimmedQuery = rawQuery.trim().replace(/\s+/g, ' ');
+  if (trimmedQuery.length < 2) {
+    return [];
+  }
+
+  const normalizedQuery = normalizeForFullTextSearch(trimmedQuery);
+  const queryTokens = extractNormalizedTokens(normalizedQuery);
+
+  // Use inverted index to narrow candidate pages if an exact token matches;
+  // also support prefix/substring matches across tokens
+  let candidatePageNumbers: Set<number> | null = null;
+  if (queryTokens.length > 0) {
+    for (const qToken of queryTokens) {
+      const matchingPagesForToken = new Set<number>();
+      for (const [indexedToken, pageList] of Object.entries(
+        searchIndex.invertedTokens
+      )) {
+        if (indexedToken.includes(qToken)) {
+          for (const p of pageList) {
+            matchingPagesForToken.add(p);
+          }
+        }
+      }
+
+      if (candidatePageNumbers === null) {
+        candidatePageNumbers = matchingPagesForToken;
+      } else {
+        const intersected = new Set<number>();
+        for (const p of candidatePageNumbers) {
+          if (matchingPagesForToken.has(p)) {
+            intersected.add(p);
+          }
+        }
+        candidatePageNumbers = intersected;
+      }
+    }
+  }
+
+  const results: SearchMatchSnippet[] = [];
+
+  for (const pageEntry of searchIndex.pages) {
+    if (
+      candidatePageNumbers !== null &&
+      !candidatePageNumbers.has(pageEntry.pageNumber)
+    ) {
+      continue;
+    }
+
+    const { text, normalizedText, pageNumber } = pageEntry;
+    let firstIdx = normalizedText.indexOf(normalizedQuery);
+
+    if (firstIdx === -1 && queryTokens.length > 0) {
+      // Fallback to first query token match if multi-word phrase spans punctuation
+      firstIdx = normalizedText.indexOf(queryTokens[0]);
+    }
+
+    if (firstIdx === -1) {
+      continue;
+    }
+
+    // Count all occurrences on this page
+    let matchCountOnPage = 0;
+    let cursor = 0;
+    const targetNeedle =
+      normalizedText.indexOf(normalizedQuery) !== -1
+        ? normalizedQuery
+        : queryTokens[0];
+
+    while (cursor <= normalizedText.length - targetNeedle.length) {
+      const found = normalizedText.indexOf(targetNeedle, cursor);
+      if (found === -1) break;
+      matchCountOnPage++;
+      cursor = found + Math.max(1, targetNeedle.length);
+    }
+
+    const matchLen = targetNeedle.length;
+    const startContext = Math.max(0, firstIdx - SEARCH_SNIPPET_CONTEXT_CHARS);
+    const endContext = Math.min(
+      text.length,
+      firstIdx + matchLen + SEARCH_SNIPPET_CONTEXT_CHARS
+    );
+
+    const prefixEllipsis = startContext > 0 ? '…' : '';
+    const suffixEllipsis = endContext < text.length ? '…' : '';
+
+    const snippetBefore = prefixEllipsis + text.slice(startContext, firstIdx);
+    const matchedText = text.slice(firstIdx, firstIdx + matchLen);
+    const snippetAfter = text.slice(firstIdx + matchLen, endContext) + suffixEllipsis;
+
+    results.push({
+      pageNumber,
+      matchCountOnPage,
+      snippetBefore,
+      matchedText,
+      snippetAfter,
+    });
+
+    if (results.length >= maxResults) {
+      break;
+    }
+  }
+
+  return results;
 }

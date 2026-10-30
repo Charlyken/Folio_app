@@ -13,17 +13,18 @@ import {
   PdfChunkedSource,
   PdfDocumentMetadata,
   PdfOutlineItem,
+  PdfTextSpanItem,
   RenderPageOptions,
 } from '../../domain/services/IPdfEngine';
 
-// Configure Web Worker once so PDF parsing and rasterization never block the Main Thread
+// Configure Web Worker once so PDF parsing, text extraction, and rasterization never block the Main Thread
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 const COVER_THUMBNAIL_SCALE = 0.75;
 const COVER_JPEG_QUALITY = 0.85;
 const MAX_CACHED_PREFETCH_PAGES = 4;
 const MAX_CACHED_THUMBNAILS = 24;
-const AUTO_CROP_MARGIN_RATIO = 0.085; // Trim 8.5% outer academic margins when Auto-Crop is active
+const AUTO_CROP_MARGIN_RATIO = 0.085;
 
 interface RawPdfMetadataInfo {
   Title?: string;
@@ -34,6 +35,14 @@ interface RawOutlineNode {
   title: string;
   dest: string | unknown[] | null;
   items?: RawOutlineNode[];
+}
+
+interface RawTextItem {
+  str?: string;
+  transform?: number[];
+  width?: number;
+  height?: number;
+  hasEOL?: boolean;
 }
 
 class PdfJsDocumentHandle implements IPdfDocumentHandle {
@@ -121,7 +130,6 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
 
     const page = await this.getOrLoadPage(pageNumber);
 
-    // When Auto-Crop is enabled, zoom into the central printable area by trimming outer margins
     const cropZoomBoost = autoCropMargins ? 1 / (1 - AUTO_CROP_MARGIN_RATIO * 2) : 1;
     const effectiveScale = scale * cropZoomBoost;
 
@@ -146,7 +154,6 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
     context.fillStyle = '#FFFFFF';
     context.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Offset viewport origin when autoCropMargins is enabled so outer margins are cropped out
     const offsetX = autoCropMargins
       ? -Math.floor(fullRenderViewport.width * AUTO_CROP_MARGIN_RATIO)
       : 0;
@@ -185,6 +192,114 @@ class PdfJsDocumentHandle implements IPdfDocumentHandle {
         this.activeRenderTasks.delete(canvas);
       }
     }
+  }
+
+  /**
+   * Computes normalized [0..1] text span bounding boxes aligned with the rendered PDF viewport
+   * (including when Auto-Crop Margins is enabled) to power the transparent vector TextLayer.
+   */
+  public async getPageTextItems(
+    pageNumber: number,
+    autoCropMargins = false
+  ): Promise<readonly PdfTextSpanItem[]> {
+    try {
+      const page = await this.getOrLoadPage(pageNumber);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const cropZoomBoost = autoCropMargins
+        ? 1 / (1 - AUTO_CROP_MARGIN_RATIO * 2)
+        : 1;
+      const fullViewport = page.getViewport({ scale: cropZoomBoost });
+      const offsetX = autoCropMargins
+        ? -fullViewport.width * AUTO_CROP_MARGIN_RATIO
+        : 0;
+      const offsetY = autoCropMargins
+        ? -fullViewport.height * AUTO_CROP_MARGIN_RATIO
+        : 0;
+      const activeViewport = fullViewport.clone({ offsetX, offsetY });
+
+      const textContent = await page.getTextContent();
+      const spans: PdfTextSpanItem[] = [];
+
+      const pageWidth = Math.max(1, baseViewport.width);
+      const pageHeight = Math.max(1, baseViewport.height);
+
+      for (const raw of textContent.items as RawTextItem[]) {
+        const str = raw.str ?? '';
+        if (!str || str.trim().length === 0 || !Array.isArray(raw.transform)) {
+          continue;
+        }
+
+        // Transform matrix from PDF user space to viewport CSS space
+        const tx = pdfjsLib.Util.transform(
+          activeViewport.transform,
+          raw.transform
+        );
+        const fontHeightPx = Math.hypot(tx[2], tx[3]);
+        const leftPx = tx[4];
+        const baselineYPx = tx[5];
+        const topPx = baselineYPx - fontHeightPx * 0.84;
+        const widthPx =
+          (typeof raw.width === 'number' && raw.width > 0
+            ? raw.width
+            : str.length * (fontHeightPx * 0.5)) * cropZoomBoost;
+
+        const xRatio = leftPx / pageWidth;
+        const yRatio = topPx / pageHeight;
+        const widthRatio = widthPx / pageWidth;
+        const heightRatio = (fontHeightPx * 1.15) / pageHeight;
+        const fontSizeRatio = fontHeightPx / pageHeight;
+
+        if (xRatio >= -0.05 && xRatio <= 1.05 && yRatio >= -0.05 && yRatio <= 1.05) {
+          spans.push({
+            str,
+            xRatio,
+            yRatio,
+            widthRatio,
+            heightRatio,
+            fontSizeRatio,
+          });
+        }
+      }
+
+      return spans;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Extracts plain text across all pages of the PDF document via the PDF.js Web Worker
+   * to construct the full-text inverted search index (`books_search_index`).
+   */
+  public async extractAllPagesPlainText(): Promise<
+    readonly { readonly pageNumber: number; readonly text: string }[]
+  > {
+    const pagesText: { readonly pageNumber: number; readonly text: string }[] = [];
+
+    for (let pageNum = 1; pageNum <= this.pdfDoc.numPages; pageNum++) {
+      try {
+        const page = await this.pdfDoc.getPage(pageNum);
+        const content = await page.getTextContent();
+        const chunks: string[] = [];
+        for (const item of content.items as RawTextItem[]) {
+          if (typeof item.str === 'string' && item.str.length > 0) {
+            chunks.push(item.str);
+            if (item.hasEOL) {
+              chunks.push(' ');
+            }
+          }
+        }
+        pagesText.push({
+          pageNumber: pageNum,
+          text: chunks.join(' ').replace(/\s+/g, ' ').trim(),
+        });
+        page.cleanup();
+      } catch {
+        pagesText.push({ pageNumber: pageNum, text: '' });
+      }
+    }
+
+    return pagesText;
   }
 
   public async renderPageThumbnail(
@@ -340,7 +455,6 @@ export class PdfJsAdapter implements IPdfEngine {
   ): Promise<IPdfDocumentHandle> {
     try {
       if (isChunkedSource(source)) {
-        // Use PDFDataRangeTransport for streaming chunked ranges from IndexedDB
         const RangeTransportClass = pdfjsLib.PDFDataRangeTransport;
         const transport = new RangeTransportClass(source.length, new Uint8Array(0));
         transport.requestDataRange = (begin: number, end: number) => {
@@ -399,6 +513,7 @@ export class PdfJsAdapter implements IPdfEngine {
     readonly author: string;
     readonly totalPages: number;
     readonly coverDataUrl: string;
+    readonly pagesText: readonly { readonly pageNumber: number; readonly text: string }[];
   }> {
     const handle = await this.loadDocument(source);
     const offscreenCanvas = document.createElement('canvas');
@@ -417,6 +532,8 @@ export class PdfJsAdapter implements IPdfEngine {
         COVER_JPEG_QUALITY
       );
 
+      const pagesText = await handle.extractAllPagesPlainText();
+
       const cleanedFallback = fallbackTitle
         .replace(/\.pdf$/i, '')
         .replace(/[-_]+/g, ' ')
@@ -427,6 +544,7 @@ export class PdfJsAdapter implements IPdfEngine {
         author: metadata.author || 'Auteur non spécifié',
         totalPages: metadata.totalPages,
         coverDataUrl,
+        pagesText,
       };
     } finally {
       offscreenCanvas.width = 0;

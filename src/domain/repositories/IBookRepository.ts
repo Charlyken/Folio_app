@@ -5,6 +5,7 @@
 
 import { Book, BookWithProgress } from '../entities/Book';
 import { ReadingSession } from '../entities/ReadingSession';
+import { BookSearchIndex } from '../entities/SearchIndex';
 
 export interface IBookRepository {
   /**
@@ -12,6 +13,16 @@ export interface IBookRepository {
    * split into 2 MB ArrayBuffer chunks inside IndexedDB (`books_chunks`).
    */
   saveBook(book: Book, pdfBlob: Blob, initialSession?: ReadingSession): Promise<void>;
+
+  /**
+   * Saves the full-text inverted search index for a book inside the `books_search_index` Object Store.
+   */
+  saveBookSearchIndex(searchIndex: BookSearchIndex): Promise<void>;
+
+  /**
+   * Retrieves the persisted full-text search index for a book, or null if not yet indexed.
+   */
+  getBookSearchIndex(bookId: string): Promise<BookSearchIndex | null>;
 
   /**
    * Finds an existing book in the library matching the given SHA-256 content hash.
@@ -46,12 +57,12 @@ export interface IBookRepository {
 
   /**
    * Updates the reading session (currentPage, zoomLevel, theme, viewMode, autoCropMargins,
-   * averageSecondsPerPage, bookmarks, annotations) and updates the book's lastReadAt timestamp.
+   * averageSecondsPerPage, bookmarks, annotations, highlights) and updates the book's lastReadAt timestamp.
    */
   updateReadingProgress(session: ReadingSession): Promise<void>;
 
   /**
-   * Deletes the book metadata, reading session, and all binary chunks from persistent storage.
+   * Deletes the book metadata, reading session, search index, and all binary chunks from persistent storage.
    */
   deleteBook(bookId: string): Promise<void>;
 }

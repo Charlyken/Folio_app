@@ -14,24 +14,32 @@ import {
   Download,
   FileJson,
   FileText,
+  Highlighter,
   List,
+  Loader2,
   MessageSquarePlus,
   Minus,
   Plus,
   RotateCcw,
+  Search,
   Trash2,
   Upload,
   X,
 } from 'lucide-react';
 import {
+  HighlightColor,
   ReaderAnnotation,
+  ReaderHighlight,
   ReaderTheme,
   ReaderViewMode,
 } from '../../../domain/entities/ReadingSession';
+import { SearchMatchSnippet } from '../../../domain/entities/SearchIndex';
 import {
   IPdfDocumentHandle,
   PdfOutlineItem,
 } from '../../../domain/services/IPdfEngine';
+
+export type DrawerTab = 'outline' | 'search' | 'bookmarks' | 'annotations';
 
 export interface ReaderControlsProps {
   readonly documentHandle: IPdfDocumentHandle;
@@ -49,14 +57,23 @@ export interface ReaderControlsProps {
   readonly autoCropMargins: boolean;
   readonly bookmarks: readonly number[];
   readonly annotations: readonly ReaderAnnotation[];
+  readonly highlights: readonly ReaderHighlight[];
+  readonly searchQuery: string;
+  readonly searchResults: readonly SearchMatchSnippet[];
+  readonly searchDurationMs: number;
+  readonly isIndexingSearch: boolean;
   readonly isCurrentPageBookmarked: boolean;
   readonly outline: readonly PdfOutlineItem[];
   readonly isChromeVisible: boolean;
   readonly isDrawerOpen: boolean;
+  readonly activeDrawerTab: DrawerTab;
+  readonly onSetActiveDrawerTab: (tab: DrawerTab) => void;
   readonly onToggleDrawer: () => void;
+  readonly onOpenSearchDrawer: () => void;
   readonly onCloseDrawer: () => void;
   readonly onBackToLibrary: () => void;
   readonly onGoToPage: (pageNumber: number) => void;
+  readonly onSetSearchQuery: (query: string) => void;
   readonly onSetTheme: (theme: ReaderTheme) => void;
   readonly onSetViewMode: (viewMode: ReaderViewMode) => void;
   readonly onToggleAutoCropMargins: () => void;
@@ -65,8 +82,14 @@ export interface ReaderControlsProps {
   readonly onResetZoom: () => void;
   readonly onToggleBookmarkCurrent: () => void;
   readonly onToggleBookmarkPage: (pageNumber: number) => void;
-  readonly onAddAnnotation: (note: string, color?: ReaderAnnotation['color']) => void;
+  readonly onAddAnnotation: (
+    note: string,
+    color?: HighlightColor,
+    quotedText?: string,
+    pageNumber?: number
+  ) => void;
   readonly onRemoveAnnotation: (annotationId: string) => void;
+  readonly onRemoveHighlight: (highlightId: string) => void;
   readonly onExportMarkdown: () => void;
   readonly onExportJson: () => void;
   readonly onImportJson: (rawJson: string) => {
@@ -75,8 +98,6 @@ export interface ReaderControlsProps {
   };
   readonly onChromeInteraction: () => void;
 }
-
-type DrawerTab = 'outline' | 'bookmarks' | 'annotations';
 
 export const ReaderControls: React.FC<ReaderControlsProps> = ({
   documentHandle,
@@ -94,14 +115,23 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
   autoCropMargins,
   bookmarks,
   annotations,
+  highlights,
+  searchQuery,
+  searchResults,
+  searchDurationMs,
+  isIndexingSearch,
   isCurrentPageBookmarked,
   outline,
   isChromeVisible,
   isDrawerOpen,
+  activeDrawerTab,
+  onSetActiveDrawerTab,
   onToggleDrawer,
+  onOpenSearchDrawer,
   onCloseDrawer,
   onBackToLibrary,
   onGoToPage,
+  onSetSearchQuery,
   onSetTheme,
   onSetViewMode,
   onToggleAutoCropMargins,
@@ -112,15 +142,16 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
   onToggleBookmarkPage,
   onAddAnnotation,
   onRemoveAnnotation,
+  onRemoveHighlight,
   onExportMarkdown,
   onExportJson,
   onImportJson,
   onChromeInteraction,
 }) => {
-  const [activeDrawerTab, setActiveDrawerTab] = useState<DrawerTab>('outline');
   const [noteInput, setNoteInput] = useState<string>('');
   const [importFeedback, setImportFeedback] = useState<string | null>(null);
   const jsonInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   // Thumbnail Scrubbing state
   const [previewPage, setPreviewPage] = useState<number | null>(null);
@@ -134,6 +165,15 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
   };
 
   const activeSurface = surfaceStyles[theme];
+
+  // Auto-focus search input when Search tab opens
+  useEffect(() => {
+    if (isDrawerOpen && activeDrawerTab === 'search') {
+      window.setTimeout(() => {
+        searchInputRef.current?.focus();
+      }, 60);
+    }
+  }, [isDrawerOpen, activeDrawerTab]);
 
   // Generate low-overhead thumbnail on the fly when previewPage changes
   useEffect(() => {
@@ -195,7 +235,6 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
     }
   };
 
-  // Resolve chapter title for previewPage if available
   const getPreviewChapterTitle = (pageNum: number): string | null => {
     let title: string | null = null;
     for (const item of outline) {
@@ -205,6 +244,8 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
     }
     return title;
   };
+
+  const totalNotesAndHighlights = annotations.length + highlights.length;
 
   return (
     <>
@@ -218,13 +259,13 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
             : 'opacity-0 pointer-events-none'
         }`}
       >
-        {/* Left: Back to Library & TOC Drawer Button */}
-        <div className="flex items-center gap-2 sm:gap-4 shrink-0">
+        {/* Left: Back to Library, TOC Drawer & Full-Text Search Button */}
+        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
           <button
             type="button"
             onClick={onBackToLibrary}
             aria-label="Retour à la bibliothèque"
-            className="px-3 py-1.5 text-xs font-medium flex items-center gap-2 hover:opacity-75 transition-opacity whitespace-nowrap shrink-0 cursor-pointer"
+            className="px-2.5 py-1.5 text-xs font-medium flex items-center gap-2 hover:opacity-75 transition-opacity whitespace-nowrap shrink-0 cursor-pointer"
           >
             <ArrowLeft className="w-4 h-4" />
             <span className="hidden sm:inline">Bibliothèque</span>
@@ -239,15 +280,25 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
             onClick={onToggleDrawer}
             aria-label="Ouvrir la table des matières et les signets"
             aria-expanded={isDrawerOpen}
-            className="px-3 py-1.5 text-xs font-medium flex items-center gap-2 hover:opacity-75 transition-opacity whitespace-nowrap shrink-0 cursor-pointer"
+            className="px-2.5 py-1.5 text-xs font-medium flex items-center gap-2 hover:opacity-75 transition-opacity whitespace-nowrap shrink-0 cursor-pointer"
           >
             <List className="w-4 h-4" />
-            <span>Sommaire & Signets</span>
-            {bookmarks.length > 0 && (
+            <span>Sommaire & Notes</span>
+            {bookmarks.length + totalNotesAndHighlights > 0 && (
               <span className="font-mono tabular-nums opacity-75">
-                ({bookmarks.length})
+                ({bookmarks.length + totalNotesAndHighlights})
               </span>
             )}
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenSearchDrawer}
+            aria-label="Rechercher dans le texte intégral du livre"
+            className="px-2.5 py-1.5 text-xs font-medium border border-current/15 hover:bg-current/10 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            <Search className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Rechercher</span>
           </button>
         </div>
 
@@ -261,7 +312,7 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
 
         {/* Right: Theme Switcher, View Mode, Auto-Crop Margins, Zoom & Bookmark */}
         <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
-          {/* Theme Switcher: Jour Blanc | Sépia Chaleureux | Nuit Noire */}
+          {/* Theme Switcher */}
           <div
             role="group"
             aria-label="Thème de lecture"
@@ -344,7 +395,7 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
             </button>
           </div>
 
-          {/* Auto-Crop Academic Whitespace Toggle (Kindle Oasis / Scribe) */}
+          {/* Auto-Crop Academic Whitespace Toggle */}
           <button
             type="button"
             onClick={onToggleAutoCropMargins}
@@ -421,11 +472,10 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
             : 'opacity-0 pointer-events-none'
         }`}
       >
-        {/* Floating Thumbnail Filmstrip Popover on Scrubber Hover/Drag */}
         {previewPage !== null && (
           <div
             data-testid="scrubber-thumbnail-popover"
-            className={` pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-3 p-3 border shadow-2xl flex flex-col items-center w-44 ${activeSurface}`}
+            className={`pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-3 p-3 border shadow-2xl flex flex-col items-center w-44 ${activeSurface}`}
           >
             <div className="w-28 aspect-[3/4] bg-white border border-current/15 overflow-hidden mb-2 flex items-center justify-center">
               {previewThumbUrl ? (
@@ -453,7 +503,6 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
 
         <div className="max-w-5xl mx-auto flex flex-col gap-1.5">
           <div className="flex flex-col sm:flex-row items-center gap-3 sm:gap-6">
-            {/* Page Indicator */}
             <div className="text-xs font-mono tabular-nums whitespace-nowrap shrink-0">
               <span>
                 {visiblePages.length > 1
@@ -462,7 +511,6 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
               </span>
             </div>
 
-            {/* Interactive Scrubber Slider with Thumbnail Hover Detection */}
             <div
               ref={scrubberContainerRef}
               onMouseMove={handleScrubberMouseMove}
@@ -486,7 +534,6 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
               />
             </div>
 
-            {/* Progress & Remaining Percentage */}
             <div className="flex items-center gap-2 text-xs font-mono tabular-nums opacity-85 whitespace-nowrap shrink-0">
               <span>{progressPercentage}% lu</span>
               <span aria-hidden="true">·</span>
@@ -494,32 +541,30 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
             </div>
           </div>
 
-          {/* Kindle Oasis Dynamic Reading Speed & Remaining Time Row */}
           <div className="flex items-center justify-between text-[11px] opacity-70 font-mono tabular-nums">
             <span className="flex items-center gap-1.5 truncate">
               <Clock className="w-3 h-3 shrink-0" />
               <span data-testid="reader-eta-summary">{readingTimeSummary}</span>
             </span>
             <span className="hidden sm:inline">
+              Sélectionnez du texte sur la page pour surligner ou citer ·{' '}
               {autoCropMargins ? 'Recadrage marges : Actif' : 'Marges d’origine'}
             </span>
           </div>
         </div>
       </footer>
 
-      {/* TABLE OF CONTENTS / BOOKMARKS / ANNOTATIONS DRAWER */}
+      {/* TABLE OF CONTENTS / FULL-TEXT SEARCH / BOOKMARKS / ANNOTATIONS DRAWER */}
       {isDrawerOpen && (
         <div className="fixed inset-0 z-40 flex">
-          {/* Backdrop */}
           <div
             onClick={onCloseDrawer}
             aria-hidden="true"
             className="fixed inset-0 bg-black/40 backdrop-blur-xs transition-opacity"
           />
 
-          {/* Drawer Panel */}
           <aside
-            aria-label="Table des matières, signets et notes"
+            aria-label="Table des matières, recherche plein texte, signets et notes"
             className={`relative z-50 w-full max-w-md h-full border-r flex flex-col shadow-2xl ${activeSurface}`}
           >
             {/* Drawer Header */}
@@ -538,17 +583,17 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
               </button>
             </div>
 
-            {/* Drawer Segmented Tabs */}
+            {/* Drawer 4 Segmented Tabs */}
             <div
               role="tablist"
               aria-label="Sections du tiroir"
-              className="grid grid-cols-3 border-b border-current/10 text-xs font-medium"
+              className="grid grid-cols-4 border-b border-current/10 text-xs font-medium"
             >
               <button
                 type="button"
                 role="tab"
                 aria-selected={activeDrawerTab === 'outline'}
-                onClick={() => setActiveDrawerTab('outline')}
+                onClick={() => onSetActiveDrawerTab('outline')}
                 className={`py-3 text-center border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   activeDrawerTab === 'outline'
                     ? 'border-[#9A3412] font-semibold'
@@ -560,8 +605,21 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
               <button
                 type="button"
                 role="tab"
+                aria-selected={activeDrawerTab === 'search'}
+                onClick={() => onSetActiveDrawerTab('search')}
+                className={`py-3 text-center border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeDrawerTab === 'search'
+                    ? 'border-[#9A3412] font-semibold'
+                    : 'border-transparent opacity-65 hover:opacity-100'
+                }`}
+              >
+                Recherche
+              </button>
+              <button
+                type="button"
+                role="tab"
                 aria-selected={activeDrawerTab === 'bookmarks'}
-                onClick={() => setActiveDrawerTab('bookmarks')}
+                onClick={() => onSetActiveDrawerTab('bookmarks')}
                 className={`py-3 text-center border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   activeDrawerTab === 'bookmarks'
                     ? 'border-[#9A3412] font-semibold'
@@ -574,14 +632,14 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                 type="button"
                 role="tab"
                 aria-selected={activeDrawerTab === 'annotations'}
-                onClick={() => setActiveDrawerTab('annotations')}
+                onClick={() => onSetActiveDrawerTab('annotations')}
                 className={`py-3 text-center border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   activeDrawerTab === 'annotations'
                     ? 'border-[#9A3412] font-semibold'
                     : 'border-transparent opacity-65 hover:opacity-100'
                 }`}
               >
-                Notes ({annotations.length})
+                Notes ({totalNotesAndHighlights})
               </button>
             </div>
 
@@ -654,7 +712,119 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                 </div>
               )}
 
-              {/* TAB 2: BOOKMARKS */}
+              {/* TAB 2: FULL-TEXT INVERTED INDEX SEARCH (`books_search_index`) */}
+              {activeDrawerTab === 'search' && (
+                <div>
+                  <div className="mb-4">
+                    <label
+                      htmlFor="in-book-fulltext-search"
+                      className="block text-xs font-medium mb-2 opacity-80"
+                    >
+                      Recherche plein texte dans l’index inversé IndexedDB
+                    </label>
+                    <div className="relative">
+                      <Search className="w-4 h-4 opacity-50 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        id="in-book-fulltext-search"
+                        ref={searchInputRef}
+                        type="search"
+                        value={searchQuery}
+                        onChange={(e) => onSetSearchQuery(e.target.value)}
+                        placeholder="Mot-clé ou citation (ex. lumière, fonte, Garamond)…"
+                        className="w-full pl-9 pr-3 py-2 text-xs border border-current/25 bg-transparent focus:outline-none focus:border-[#9A3412]"
+                      />
+                    </div>
+                  </div>
+
+                  {isIndexingSearch && (
+                    <div className="py-8 flex items-center justify-center gap-2 text-xs opacity-75">
+                      <Loader2 className="w-4 h-4 animate-spin text-[#9A3412]" />
+                      <span>Indexation plein texte des pages en cours…</span>
+                    </div>
+                  )}
+
+                  {!isIndexingSearch && searchQuery.trim().length < 2 && (
+                    <div className="py-10 text-center opacity-70">
+                      <Search className="w-7 h-7 mx-auto mb-2 stroke-[1.5]" />
+                      <p className="text-sm font-medium">
+                        Index inversé (`books_search_index`) prêt
+                      </p>
+                      <p className="text-xs mt-1">
+                        Saisissez au moins 2 caractères pour rechercher instantanément (&lt; 20 ms) à travers toutes les pages de l’ouvrage.
+                      </p>
+                    </div>
+                  )}
+
+                  {!isIndexingSearch &&
+                    searchQuery.trim().length >= 2 &&
+                    searchResults.length === 0 && (
+                      <div className="py-10 text-center opacity-70">
+                        <p className="text-sm font-medium">
+                          Aucune occurrence trouvée pour « {searchQuery} »
+                        </p>
+                        <p className="text-xs font-mono tabular-nums mt-1">
+                          Requête exécutée en {searchDurationMs} ms
+                        </p>
+                      </div>
+                    )}
+
+                  {!isIndexingSearch &&
+                    searchQuery.trim().length >= 2 &&
+                    searchResults.length > 0 && (
+                      <div>
+                        <div className="flex items-center justify-between text-xs font-mono tabular-nums opacity-75 mb-3 pb-2 border-b border-current/10">
+                          <span>
+                            {searchResults.length} page
+                            {searchResults.length > 1 ? 's' : ''} correspondante
+                            {searchResults.length > 1 ? 's' : ''}
+                          </span>
+                          <span>{searchDurationMs} ms</span>
+                        </div>
+
+                        <ul
+                          data-testid="fulltext-search-results"
+                          className="space-y-3"
+                        >
+                          {searchResults.map((hit) => (
+                            <li key={hit.pageNumber}>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onGoToPage(hit.pageNumber);
+                                  onCloseDrawer();
+                                }}
+                                className="w-full p-3.5 text-left border border-current/15 hover:border-[#9A3412] bg-current/5 transition-colors cursor-pointer"
+                              >
+                                <div className="flex items-center justify-between text-xs font-mono tabular-nums mb-1.5">
+                                  <span className="font-semibold text-[#9A3412] dark:text-amber-400">
+                                    Page {hit.pageNumber}
+                                  </span>
+                                  <span className="opacity-65">
+                                    {hit.matchCountOnPage} occurrence
+                                    {hit.matchCountOnPage > 1 ? 's' : ''}
+                                  </span>
+                                </div>
+                                <p className="text-xs leading-relaxed font-serif">
+                                  <span className="opacity-75">
+                                    {hit.snippetBefore}
+                                  </span>
+                                  <mark className="bg-amber-400/45 text-current font-semibold px-0.5">
+                                    {hit.matchedText}
+                                  </mark>
+                                  <span className="opacity-75">
+                                    {hit.snippetAfter}
+                                  </span>
+                                </p>
+                              </button>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                </div>
+              )}
+
+              {/* TAB 3: BOOKMARKS */}
               {activeDrawerTab === 'bookmarks' && (
                 <div>
                   <div className="mb-4 flex items-center justify-between">
@@ -720,7 +890,7 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                 </div>
               )}
 
-              {/* TAB 3: ANNOTATIONS & STUDY SHEET EXPORT / IMPORT */}
+              {/* TAB 4: HIGHLIGHTS, ANNOTATIONS & STUDY SHEET EXPORT / IMPORT */}
               {activeDrawerTab === 'annotations' && (
                 <div>
                   <form onSubmit={handleNoteSubmit} className="mb-5">
@@ -750,7 +920,7 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                     </div>
                   </form>
 
-                  {/* Export / Import Study Sheet Bar (Kindle Scribe Notebook Tools) */}
+                  {/* Export / Import Study Sheet Bar */}
                   <div className="mb-5 p-3 border border-current/15 bg-current/5 flex flex-col gap-2.5">
                     <p className="text-[11px] uppercase tracking-wider opacity-70 font-medium">
                       Carnet d’étude — Export & Sauvegarde
@@ -802,13 +972,55 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                     )}
                   </div>
 
-                  {annotations.length === 0 ? (
+                  {/* Ink Highlights Section */}
+                  {highlights.length > 0 && (
+                    <div className="mb-6">
+                      <h3 className="text-xs uppercase tracking-wider opacity-70 font-medium mb-2.5 flex items-center gap-1.5">
+                        <Highlighter className="w-3.5 h-3.5" />
+                        <span>Passages surlignés ({highlights.length})</span>
+                      </h3>
+                      <ul className="space-y-2.5">
+                        {highlights.map((hl) => (
+                          <li
+                            key={hl.id}
+                            className="p-3 border border-current/15 bg-current/5 flex items-start justify-between gap-3"
+                          >
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onGoToPage(hl.pageNumber);
+                                onCloseDrawer();
+                              }}
+                              className="flex-1 text-left cursor-pointer"
+                            >
+                              <p className="text-xs font-mono tabular-nums text-[#9A3412] dark:text-amber-400 font-semibold">
+                                Page {hl.pageNumber} · Encre {hl.color}
+                              </p>
+                              <p className="text-xs font-serif italic mt-1 leading-relaxed">
+                                « {hl.text} »
+                              </p>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => onRemoveHighlight(hl.id)}
+                              aria-label={`Supprimer le surlignage de la page ${hl.pageNumber}`}
+                              className="p-1 opacity-60 hover:opacity-100 hover:text-red-600 transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+
+                  {annotations.length === 0 && highlights.length === 0 ? (
                     <div className="py-8 text-center opacity-70">
                       <p className="text-sm font-medium">
-                        Aucune annotation pour cet ouvrage
+                        Aucune annotation ni surlignage
                       </p>
                       <p className="text-xs mt-1">
-                        Vos réflexions et notes de bas de page sont sauvegardées dans IndexedDB et exportables en fiche de lecture Markdown.
+                        Sélectionnez du texte directement sur la page PDF pour le surligner en couleur ou ajouter une note.
                       </p>
                     </div>
                   ) : (
@@ -837,6 +1049,11 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
                             <p className="text-xs font-mono tabular-nums text-[#9A3412] dark:text-amber-400 font-semibold">
                               Page {item.pageNumber}
                             </p>
+                            {item.quotedText && (
+                              <p className="text-xs font-serif italic opacity-75 mt-1">
+                                « {item.quotedText} »
+                              </p>
+                            )}
                             <p className="text-sm mt-1 leading-relaxed">
                               {item.note}
                             </p>
@@ -857,7 +1074,7 @@ export const ReaderControls: React.FC<ReaderControlsProps> = ({
               )}
             </div>
 
-            {/* Drawer Footer: Auto-Crop, View Mode & Reset Zoom */}
+            {/* Drawer Footer */}
             <div className="p-4 border-t border-current/10 flex flex-wrap items-center justify-between gap-2 text-xs">
               <div className="flex items-center gap-2">
                 <button

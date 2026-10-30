@@ -8,6 +8,7 @@ import {
   createInitialReadingSession,
   ReadingSession,
 } from '../../domain/entities/ReadingSession';
+import { BookSearchIndex } from '../../domain/entities/SearchIndex';
 import { createAppError } from '../../domain/entities/AsyncState';
 import { IBookRepository } from '../../domain/repositories/IBookRepository';
 import {
@@ -18,12 +19,13 @@ import {
 } from '../../domain/services/ReadingRules';
 
 const DB_NAME = 'folio_kindle_reader_db';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 const STORE_BOOKS_METADATA = 'books_metadata';
 const STORE_BOOKS_BLOBS = 'books_blobs';
 const STORE_BOOKS_CHUNKS = 'books_chunks';
 const STORE_READING_SESSIONS = 'reading_sessions';
+const STORE_BOOKS_SEARCH_INDEX = 'books_search_index';
 
 interface StoredBlobRecord {
   readonly bookId: string;
@@ -83,6 +85,12 @@ export class IndexedDbBookRepository implements IBookRepository {
 
         if (!db.objectStoreNames.contains(STORE_READING_SESSIONS)) {
           db.createObjectStore(STORE_READING_SESSIONS, {
+            keyPath: 'bookId',
+          });
+        }
+
+        if (!db.objectStoreNames.contains(STORE_BOOKS_SEARCH_INDEX)) {
+          db.createObjectStore(STORE_BOOKS_SEARCH_INDEX, {
             keyPath: 'bookId',
           });
         }
@@ -169,6 +177,39 @@ export class IndexedDbBookRepository implements IBookRepository {
     });
   }
 
+  public async saveBookSearchIndex(searchIndex: BookSearchIndex): Promise<void> {
+    const db = await this.openDatabase();
+    return new Promise<void>((resolve, reject) => {
+      const tx = db.transaction([STORE_BOOKS_SEARCH_INDEX], 'readwrite');
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => {
+        reject(
+          createAppError(
+            'UNKNOWN_ERROR',
+            'Erreur d’indexation plein texte',
+            tx.error?.message ?? 'Impossible d’enregistrer l’index de recherche.'
+          )
+        );
+      };
+      tx.objectStore(STORE_BOOKS_SEARCH_INDEX).put(searchIndex);
+    });
+  }
+
+  public async getBookSearchIndex(
+    bookId: string
+  ): Promise<BookSearchIndex | null> {
+    const db = await this.openDatabase();
+    return new Promise<BookSearchIndex | null>((resolve) => {
+      const tx = db.transaction([STORE_BOOKS_SEARCH_INDEX], 'readonly');
+      const store = tx.objectStore(STORE_BOOKS_SEARCH_INDEX);
+      const request = store.get(bookId);
+      request.onsuccess = () => {
+        resolve((request.result as BookSearchIndex | undefined) ?? null);
+      };
+      request.onerror = () => resolve(null);
+    });
+  }
+
   public async findBookByContentHash(contentHash: string): Promise<Book | null> {
     if (!contentHash) return null;
     const db = await this.openDatabase();
@@ -229,7 +270,6 @@ export class IndexedDbBookRepository implements IBookRepository {
       return new Blob(chunks, { type: 'application/pdf' });
     }
 
-    // Fallback to legacy single-blob store if present
     const db = await this.openDatabase();
     return new Promise<Blob | null>((resolve, reject) => {
       const tx = db.transaction([STORE_BOOKS_BLOBS], 'readonly');
@@ -439,6 +479,7 @@ export class IndexedDbBookRepository implements IBookRepository {
           STORE_BOOKS_BLOBS,
           STORE_BOOKS_CHUNKS,
           STORE_READING_SESSIONS,
+          STORE_BOOKS_SEARCH_INDEX,
         ],
         'readwrite'
       );
@@ -457,8 +498,8 @@ export class IndexedDbBookRepository implements IBookRepository {
       tx.objectStore(STORE_BOOKS_METADATA).delete(bookId);
       tx.objectStore(STORE_BOOKS_BLOBS).delete(bookId);
       tx.objectStore(STORE_READING_SESSIONS).delete(bookId);
+      tx.objectStore(STORE_BOOKS_SEARCH_INDEX).delete(bookId);
 
-      // Delete all chunks matching bookId
       const chunkStore = tx.objectStore(STORE_BOOKS_CHUNKS);
       const index = chunkStore.index('bookId');
       const cursorReq = index.openKeyCursor(IDBKeyRange.only(bookId));

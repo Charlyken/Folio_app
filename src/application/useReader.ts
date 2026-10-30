@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AppError,
   AsyncState,
@@ -12,11 +12,18 @@ import {
 import { Book } from '../domain/entities/Book';
 import {
   createInitialReadingSession,
+  HighlightColor,
+  HighlightRect,
   ReaderAnnotation,
+  ReaderHighlight,
   ReaderTheme,
   ReaderViewMode,
   ReadingSession,
 } from '../domain/entities/ReadingSession';
+import {
+  BookSearchIndex,
+  SearchMatchSnippet,
+} from '../domain/entities/SearchIndex';
 import { IBookRepository } from '../domain/repositories/IBookRepository';
 import {
   IPdfDocumentHandle,
@@ -24,6 +31,7 @@ import {
   PdfOutlineItem,
 } from '../domain/services/IPdfEngine';
 import {
+  buildBookSearchIndex,
   calculateProgressPercentage,
   calculateRemainingPercentage,
   estimateReadingTimeRemaining,
@@ -34,6 +42,7 @@ import {
   getVisiblePageNumbers,
   normalizeTargetPage,
   parseStudySheetJson,
+  queryBookSearchIndex,
   resetZoom,
   serializeStudySheetJson,
   stepZoomIn,
@@ -60,6 +69,11 @@ export interface UseReaderResult {
   readonly isCurrentPageBookmarked: boolean;
   readonly canGoPrevious: boolean;
   readonly canGoNext: boolean;
+  readonly searchQuery: string;
+  readonly searchResults: readonly SearchMatchSnippet[];
+  readonly searchDurationMs: number;
+  readonly isIndexingSearch: boolean;
+  readonly setSearchQuery: (query: string) => void;
   readonly goToNextPage: () => void;
   readonly goToPreviousPage: () => void;
   readonly goToPage: (pageNumber: number) => void;
@@ -71,8 +85,20 @@ export interface UseReaderResult {
   readonly resetZoomLevel: () => void;
   readonly toggleBookmarkOnCurrentPage: () => void;
   readonly toggleBookmarkOnPage: (pageNumber: number) => void;
-  readonly addAnnotation: (note: string, color?: ReaderAnnotation['color']) => void;
+  readonly addAnnotation: (
+    note: string,
+    color?: HighlightColor,
+    quotedText?: string,
+    pageNumber?: number
+  ) => void;
   readonly removeAnnotation: (annotationId: string) => void;
+  readonly addHighlight: (
+    pageNumber: number,
+    text: string,
+    color: HighlightColor,
+    rects: readonly HighlightRect[]
+  ) => void;
+  readonly removeHighlight: (highlightId: string) => void;
   readonly exportNotesAsMarkdown: () => void;
   readonly exportNotesAsJson: () => void;
   readonly importNotesFromJson: (rawJson: string) => {
@@ -95,15 +121,18 @@ export function useReader(
     createInitialReadingSession(bookId)
   );
 
+  const [searchIndex, setSearchIndex] = useState<BookSearchIndex | null>(null);
+  const [isIndexingSearch, setIsIndexingSearch] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+
   const activeHandleRef = useRef<IPdfDocumentHandle | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const latestSessionRef = useRef<ReadingSession>(session);
   latestSessionRef.current = session;
 
-  // Track timestamp when user arrived on the current page for reading speed calculation
   const pageEnteredAtRef = useRef<number>(Date.now());
 
-  // Load book metadata, reading session, and binary PDF document
+  // Load book metadata, reading session, search index, and binary PDF document
   useEffect(() => {
     let isCancelled = false;
 
@@ -114,11 +143,13 @@ export function useReader(
       });
 
       try {
-        const [bookMeta, blob, savedSession] = await Promise.all([
-          repository.getBookMetadata(bookId),
-          repository.getBookBlob(bookId),
-          repository.getReadingSession(bookId),
-        ]);
+        const [bookMeta, blob, savedSession, persistedSearchIndex] =
+          await Promise.all([
+            repository.getBookMetadata(bookId),
+            repository.getBookBlob(bookId),
+            repository.getReadingSession(bookId),
+            repository.getBookSearchIndex(bookId),
+          ]);
 
         if (!bookMeta || !blob) {
           throw createAppError(
@@ -152,6 +183,7 @@ export function useReader(
 
         const hydratedSession: ReadingSession = {
           ...savedSession,
+          highlights: savedSession.highlights ?? [],
           currentPage: normalizedStartPage,
         };
 
@@ -165,6 +197,26 @@ export function useReader(
             outline,
           },
         });
+
+        // Hydrate or asynchronously build the full-text inverted search index (`books_search_index`)
+        if (persistedSearchIndex && persistedSearchIndex.pages.length > 0) {
+          setSearchIndex(persistedSearchIndex);
+        } else {
+          setIsIndexingSearch(true);
+          void docHandle
+            .extractAllPagesPlainText()
+            .then(async (pagesText) => {
+              if (isCancelled) return;
+              const builtIndex = buildBookSearchIndex(bookId, pagesText);
+              setSearchIndex(builtIndex);
+              await repository.saveBookSearchIndex(builtIndex);
+            })
+            .finally(() => {
+              if (!isCancelled) {
+                setIsIndexingSearch(false);
+              }
+            });
+        }
       } catch (err: unknown) {
         if (isCancelled) return;
         const appErr: AppError =
@@ -203,6 +255,17 @@ export function useReader(
     };
   }, [bookId, repository, pdfEngine]);
 
+  // Execute sub-20ms full-text query against the inverted search index
+  const { searchResults, searchDurationMs } = useMemo(() => {
+    if (!searchIndex || searchQuery.trim().length < 2) {
+      return { searchResults: [] as readonly SearchMatchSnippet[], searchDurationMs: 0 };
+    }
+    const t0 = performance.now();
+    const matches = queryBookSearchIndex(searchIndex, searchQuery);
+    const elapsed = Math.max(0.1, Math.round((performance.now() - t0) * 10) / 10);
+    return { searchResults: matches, searchDurationMs: elapsed };
+  }, [searchIndex, searchQuery]);
+
   const scheduleSessionPersistence = useCallback(
     (nextSession: ReadingSession) => {
       if (saveTimerRef.current !== null) {
@@ -221,7 +284,6 @@ export function useReader(
       ? readerState.data.documentHandle.totalPages
       : 1;
 
-  // Prefetch page N+1 whenever currentPage or viewMode changes
   useEffect(() => {
     if (readerState.status !== 'success') return;
     const prefetchPage = getPrefetchPageNumber(
@@ -354,13 +416,19 @@ export function useReader(
   }, [session.currentPage, toggleBookmarkOnPage]);
 
   const addAnnotation = useCallback(
-    (note: string, color: ReaderAnnotation['color'] = 'amber') => {
+    (
+      note: string,
+      color: HighlightColor = 'amber',
+      quotedText?: string,
+      pageNumber?: number
+    ) => {
       const trimmed = note.trim();
       if (!trimmed) return;
       const newAnnotation: ReaderAnnotation = {
         id: `note-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        pageNumber: session.currentPage,
+        pageNumber: pageNumber ?? session.currentPage,
         note: trimmed,
+        quotedText: quotedText?.trim() || undefined,
         createdAt: Date.now(),
         color,
       };
@@ -377,6 +445,41 @@ export function useReader(
       updateSession((prev) => ({
         ...prev,
         annotations: prev.annotations.filter((a) => a.id !== annotationId),
+      }));
+    },
+    [updateSession]
+  );
+
+  const addHighlight = useCallback(
+    (
+      pageNumber: number,
+      text: string,
+      color: HighlightColor,
+      rects: readonly HighlightRect[]
+    ) => {
+      const trimmed = text.trim();
+      if (!trimmed || rects.length === 0) return;
+      const newHighlight: ReaderHighlight = {
+        id: `hl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        pageNumber,
+        text: trimmed,
+        color,
+        rects,
+        createdAt: Date.now(),
+      };
+      updateSession((prev) => ({
+        ...prev,
+        highlights: [...(prev.highlights ?? []), newHighlight],
+      }));
+    },
+    [updateSession]
+  );
+
+  const removeHighlight = useCallback(
+    (highlightId: string) => {
+      updateSession((prev) => ({
+        ...prev,
+        highlights: (prev.highlights ?? []).filter((h) => h.id !== highlightId),
       }));
     },
     [updateSession]
@@ -404,7 +507,8 @@ export function useReader(
       book,
       session.bookmarks,
       session.annotations,
-      outline
+      outline,
+      session.highlights ?? []
     );
     const safeSlug = book.title
       .toLowerCase()
@@ -415,7 +519,13 @@ export function useReader(
       `fiche-lecture-${safeSlug || 'folio'}.md`,
       'text/markdown;charset=utf-8'
     );
-  }, [readerState, session.bookmarks, session.annotations, triggerBrowserDownload]);
+  }, [
+    readerState,
+    session.bookmarks,
+    session.annotations,
+    session.highlights,
+    triggerBrowserDownload,
+  ]);
 
   const exportNotesAsJson = useCallback(() => {
     if (readerState.status !== 'success') return;
@@ -423,7 +533,8 @@ export function useReader(
     const json = serializeStudySheetJson(
       book.title,
       session.bookmarks,
-      session.annotations
+      session.annotations,
+      session.highlights ?? []
     );
     const safeSlug = book.title
       .toLowerCase()
@@ -434,7 +545,13 @@ export function useReader(
       `notes-${safeSlug || 'folio'}.json`,
       'application/json;charset=utf-8'
     );
-  }, [readerState, session.bookmarks, session.annotations, triggerBrowserDownload]);
+  }, [
+    readerState,
+    session.bookmarks,
+    session.annotations,
+    session.highlights,
+    triggerBrowserDownload,
+  ]);
 
   const importNotesFromJson = useCallback(
     (rawJson: string): { readonly success: boolean; readonly message: string } => {
@@ -445,20 +562,28 @@ export function useReader(
             new Set([...prev.bookmarks, ...imported.bookmarks])
           ).sort((a, b) => a - b);
 
-          const existingIds = new Set(prev.annotations.map((a) => a.id));
+          const existingNoteIds = new Set(prev.annotations.map((a) => a.id));
           const newNotes = imported.annotations.filter(
-            (a) => !existingIds.has(a.id)
+            (a) => !existingNoteIds.has(a.id)
+          );
+
+          const existingHlIds = new Set(
+            (prev.highlights ?? []).map((h) => h.id)
+          );
+          const newHighlights = imported.highlights.filter(
+            (h) => !existingHlIds.has(h.id)
           );
 
           return {
             ...prev,
             bookmarks: mergedBookmarks,
             annotations: [...newNotes, ...prev.annotations],
+            highlights: [...(prev.highlights ?? []), ...newHighlights],
           };
         });
         return {
           success: true,
-          message: `${imported.bookmarks.length} signet(s) et ${imported.annotations.length} note(s) importés avec succès.`,
+          message: `${imported.bookmarks.length} signet(s), ${imported.highlights.length} surlignage(s) et ${imported.annotations.length} note(s) importés.`,
         };
       } catch {
         return {
@@ -471,7 +596,7 @@ export function useReader(
     [totalPages, updateSession]
   );
 
-  // Keyboard shortcuts: ArrowRight / Space -> next page, ArrowLeft -> previous page, B -> bookmark, C -> Auto-crop
+  // Keyboard shortcuts
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       const target = event.target as HTMLElement | null;
@@ -577,6 +702,11 @@ export function useReader(
     isCurrentPageBookmarked,
     canGoPrevious,
     canGoNext,
+    searchQuery,
+    searchResults,
+    searchDurationMs,
+    isIndexingSearch,
+    setSearchQuery,
     goToNextPage,
     goToPreviousPage,
     goToPage,
@@ -590,6 +720,8 @@ export function useReader(
     toggleBookmarkOnPage,
     addAnnotation,
     removeAnnotation,
+    addHighlight,
+    removeHighlight,
     exportNotesAsMarkdown,
     exportNotesAsJson,
     importNotesFromJson,

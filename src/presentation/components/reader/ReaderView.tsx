@@ -10,7 +10,7 @@ import { ReaderTheme } from '../../../domain/entities/ReadingSession';
 import { IBookRepository } from '../../../domain/repositories/IBookRepository';
 import { IPdfEngine } from '../../../domain/services/IPdfEngine';
 import { ReaderCanvas } from './ReaderCanvas';
-import { ReaderControls } from './ReaderControls';
+import { DrawerTab, ReaderControls } from './ReaderControls';
 
 export interface ReaderViewProps {
   readonly bookId: string;
@@ -49,6 +49,11 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     isCurrentPageBookmarked,
     canGoPrevious,
     canGoNext,
+    searchQuery,
+    searchResults,
+    searchDurationMs,
+    isIndexingSearch,
+    setSearchQuery,
     goToNextPage,
     goToPreviousPage,
     goToPage,
@@ -62,6 +67,8 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
     toggleBookmarkOnPage,
     addAnnotation,
     removeAnnotation,
+    addHighlight,
+    removeHighlight,
     exportNotesAsMarkdown,
     exportNotesAsJson,
     importNotesFromJson,
@@ -69,6 +76,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
 
   const [isChromeVisible, setIsChromeVisible] = useState<boolean>(true);
   const [isDrawerOpen, setIsDrawerOpen] = useState<boolean>(false);
+  const [activeDrawerTab, setActiveDrawerTab] = useState<DrawerTab>('outline');
   const idleTimerRef = useRef<number | null>(null);
 
   const scheduleAutoHideChrome = useCallback(() => {
@@ -191,17 +199,30 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         autoCropMargins={session.autoCropMargins}
         bookmarks={session.bookmarks}
         annotations={session.annotations}
+        highlights={session.highlights ?? []}
+        searchQuery={searchQuery}
+        searchResults={searchResults}
+        searchDurationMs={searchDurationMs}
+        isIndexingSearch={isIndexingSearch}
         isCurrentPageBookmarked={isCurrentPageBookmarked}
         outline={outline}
         isChromeVisible={isChromeVisible}
         isDrawerOpen={isDrawerOpen}
+        activeDrawerTab={activeDrawerTab}
+        onSetActiveDrawerTab={setActiveDrawerTab}
         onToggleDrawer={() => {
           setIsDrawerOpen((prev) => !prev);
+          setIsChromeVisible(true);
+        }}
+        onOpenSearchDrawer={() => {
+          setActiveDrawerTab('search');
+          setIsDrawerOpen(true);
           setIsChromeVisible(true);
         }}
         onCloseDrawer={() => setIsDrawerOpen(false)}
         onBackToLibrary={onBackToLibrary}
         onGoToPage={goToPage}
+        onSetSearchQuery={setSearchQuery}
         onSetTheme={setTheme}
         onSetViewMode={setViewMode}
         onToggleAutoCropMargins={toggleAutoCropMargins}
@@ -212,6 +233,7 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
         onToggleBookmarkPage={toggleBookmarkOnPage}
         onAddAnnotation={addAnnotation}
         onRemoveAnnotation={removeAnnotation}
+        onRemoveHighlight={removeHighlight}
         onExportMarkdown={exportNotesAsMarkdown}
         onExportJson={exportNotesAsJson}
         onImportJson={importNotesFromJson}
@@ -221,16 +243,25 @@ export const ReaderView: React.FC<ReaderViewProps> = ({
       <main className="flex-1 flex flex-col items-center justify-center pt-14 pb-20">
         <ReaderCanvas
           documentHandle={documentHandle}
+          bookTitle={book.title}
+          bookAuthor={book.author}
           visiblePages={visiblePages}
           zoomLevel={session.zoomLevel}
           theme={session.theme}
           viewMode={session.viewMode}
           autoCropMargins={session.autoCropMargins}
+          highlights={session.highlights ?? []}
+          activeSearchQuery={searchQuery}
           canGoPrevious={canGoPrevious}
           canGoNext={canGoNext}
           onPreviousPage={goToPreviousPage}
           onNextPage={goToNextPage}
           onCenterTap={handleCenterTap}
+          onAddHighlight={addHighlight}
+          onRemoveHighlight={removeHighlight}
+          onAddQuotedNote={(note, color, quotedText, pageNum) =>
+            addAnnotation(note, color, quotedText, pageNum)
+          }
         />
       </main>
     </div>

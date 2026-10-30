@@ -15,6 +15,7 @@ import { IBookRepository } from '../domain/repositories/IBookRepository';
 import { IPdfEngine } from '../domain/services/IPdfEngine';
 import {
   ALLOWED_PDF_MIME_TYPE,
+  buildBookSearchIndex,
   computeSha256Hex,
   MAX_PDF_FILE_SIZE_BYTES,
   PDF_CHUNK_SIZE_BYTES,
@@ -24,7 +25,7 @@ import {
   CURATED_SEED_BOOKS,
 } from '../infrastructure/pdf/SamplePdfGenerator';
 
-const SEED_COMPLETED_STORAGE_KEY = 'folio_curated_library_seeded_v3';
+const SEED_COMPLETED_STORAGE_KEY = 'folio_curated_library_seeded_v4';
 
 export type LibraryFilter = 'all' | 'in_progress' | 'completed' | 'bookmarked';
 
@@ -120,6 +121,9 @@ export function useLibrary(
           };
 
           await repository.saveBook(book, pdfBlob, initialSession);
+
+          const searchIndex = buildBookSearchIndex(spec.id, extracted.pagesText);
+          await repository.saveBookSearchIndex(searchIndex);
         }
         window.localStorage.setItem(SEED_COMPLETED_STORAGE_KEY, 'true');
       }
@@ -149,7 +153,6 @@ export function useLibrary(
     async (file: File): Promise<Book | null> => {
       setDeduplicationNotice(null);
 
-      // 1. Validate MIME type and extension
       const isPdfMime = file.type === ALLOWED_PDF_MIME_TYPE;
       const isPdfExt = file.name.toLowerCase().endsWith('.pdf');
       if (!isPdfMime && !isPdfExt) {
@@ -164,7 +167,6 @@ export function useLibrary(
         return null;
       }
 
-      // 2. Validate file size
       if (file.size > MAX_PDF_FILE_SIZE_BYTES) {
         setUploadState({
           status: 'error',
@@ -191,14 +193,13 @@ export function useLibrary(
 
       setUploadState({
         status: 'loading',
-        message: `Calcul de l’empreinte SHA-256 et découpage en segments de « ${file.name} »…`,
+        message: `Extraction de la couverture et indexation plein texte de « ${file.name} »…`,
       });
 
       try {
         const buffer = await file.arrayBuffer();
         const contentHash = await computeSha256Hex(buffer);
 
-        // 3. Check SHA-256 deduplication in IndexedDB
         const existingBook = await repository.findBookByContentHash(contentHash);
         if (existingBook) {
           const existingSession = await repository.getReadingSession(
@@ -225,8 +226,10 @@ export function useLibrary(
           Math.ceil(file.size / PDF_CHUNK_SIZE_BYTES)
         );
 
+        const newBookId = `book-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
         const newBook: Book = {
-          id: `book-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          id: newBookId,
           title: extracted.title,
           author: extracted.author,
           totalPages: extracted.totalPages,
@@ -239,6 +242,11 @@ export function useLibrary(
         };
 
         await repository.saveBook(newBook, file);
+
+        // Persist the inverted full-text search index inside `books_search_index`
+        const searchIndex = buildBookSearchIndex(newBookId, extracted.pagesText);
+        await repository.saveBookSearchIndex(searchIndex);
+
         const updatedBooks = await repository.getAllBooksMetadata();
         setLibraryState({ status: 'success', data: updatedBooks });
         setUploadState({ status: 'success', data: newBook });

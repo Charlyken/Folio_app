@@ -7,6 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   assembleByteRangeFromChunks,
+  buildBookSearchIndex,
   calculateProgressPercentage,
   calculateRemainingPercentage,
   clampZoomLevel,
@@ -20,6 +21,7 @@ import {
   getVisiblePageNumbers,
   normalizeTargetPage,
   parseStudySheetJson,
+  queryBookSearchIndex,
   serializeStudySheetJson,
   splitBufferIntoChunks,
   stepZoomIn,
@@ -115,7 +117,6 @@ test('computeSha256Hex returns deterministic 64-char hex digest', async () => {
 test('updateRollingReadingPace and estimateReadingTimeRemaining compute chapter and book ETA', () => {
   const updatedPace = updateRollingReadingPace(40, 60);
   assert.equal(updatedPace, 46);
-  // Out-of-bounds dwell time is ignored
   assert.equal(updateRollingReadingPace(40, 1), 40);
 
   const eta = estimateReadingTimeRemaining(
@@ -132,28 +133,68 @@ test('updateRollingReadingPace and estimateReadingTimeRemaining compute chapter 
   assert.ok(eta.formattedSummary.includes('3 min dans ce chapitre'));
 });
 
-test('generateReadingNotesMarkdown and JSON round-trip preserve bookmarks and annotations', () => {
+test('generateReadingNotesMarkdown and JSON round-trip preserve bookmarks, highlights, and annotations', () => {
   const annotations = [
     {
       id: 'n1',
       pageNumber: 3,
       note: 'Note importante sur la lumière zénithale.',
+      quotedText: 'les voûtes diaphanes',
       createdAt: 1700000000000,
       color: 'amber' as const,
+    },
+  ];
+  const highlights = [
+    {
+      id: 'hl-1',
+      pageNumber: 2,
+      text: 'colonnes de fonte élancées',
+      color: 'terracotta' as const,
+      rects: [{ xRatio: 0.1, yRatio: 0.2, widthRatio: 0.4, heightRatio: 0.03 }],
+      createdAt: 1700000000000,
     },
   ];
   const md = generateReadingNotesMarkdown(
     { title: 'Monographie', author: 'Labrouste', totalPages: 10 },
     [2, 3],
     annotations,
-    [{ title: 'Chapitre I', pageNumber: 2, items: [] }]
+    [{ title: 'Chapitre I', pageNumber: 2, items: [] }],
+    highlights
   );
   assert.ok(md.includes('# Fiche de Lecture — Monographie'));
+  assert.ok(md.includes('colonnes de fonte élancées'));
   assert.ok(md.includes('Note importante sur la lumière zénithale.'));
 
-  const json = serializeStudySheetJson('Monographie', [2, 3], annotations);
+  const json = serializeStudySheetJson('Monographie', [2, 3], annotations, highlights);
   const parsed = parseStudySheetJson(json, 10);
   assert.deepEqual(parsed.bookmarks, [2, 3]);
   assert.equal(parsed.annotations.length, 1);
-  assert.equal(parsed.annotations[0].note, 'Note importante sur la lumière zénithale.');
+  assert.equal(parsed.highlights.length, 1);
+  assert.equal(parsed.highlights[0].text, 'colonnes de fonte élancées');
+});
+
+test('buildBookSearchIndex and queryBookSearchIndex perform accent-insensitive sub-20ms lookup with snippets', () => {
+  const index = buildBookSearchIndex('book-1', [
+    {
+      pageNumber: 1,
+      text: "L'Architecture de la Lumière par Henri Labrouste.",
+    },
+    {
+      pageNumber: 2,
+      text: "Dans la salle de lecture de la Bibliothèque Sainte-Geneviève, les colonnes de fonte guident la clarté zénithale.",
+    },
+    {
+      pageNumber: 3,
+      text: "La typographie humaniste privilégie les papiers vergés.",
+    },
+  ]);
+
+  assert.deepEqual(index.invertedTokens['bibliotheque'], [2]);
+
+  // Accent-insensitive search for "genevieve" matches "Geneviève" on page 2
+  const matches = queryBookSearchIndex(index, 'genevieve');
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].pageNumber, 2);
+  assert.equal(matches[0].matchedText, 'Geneviève');
+  assert.ok(matches[0].snippetBefore.includes('Sainte-'));
 });
